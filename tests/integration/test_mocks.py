@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import secrets
 import time
+from collections.abc import AsyncIterator
 
 import httpx
 import pytest
@@ -33,13 +34,21 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.fixture
-async def soap() -> httpx.AsyncClient:
+async def soap() -> AsyncIterator[httpx.AsyncClient]:
     if not reachable(SOAP):
         pytest.skip("soap-mock not running (make mocks)")
-    client = httpx.AsyncClient(base_url=SOAP, timeout=10)
-    await client.post("/__faults", json={"latency_ms": 300, "busy_rate": 0, "max_concurrency": 5})
-    await client.post("/__reset")
-    return client
+    async with httpx.AsyncClient(base_url=SOAP, timeout=10) as client:
+        # Restore the fault settings we found, so no test leaves e.g. busy_rate 1.0 behind.
+        saved = (await client.get("/__stats")).json()["faults"]
+        await client.post(
+            "/__faults", json={"latency_ms": 300, "busy_rate": 0, "max_concurrency": 5}
+        )
+        await client.post("/__reset")
+        try:
+            yield client
+        finally:
+            await client.post("/__faults", json=saved)
+            await client.post("/__reset")
 
 
 async def call(client: httpx.AsyncClient, origin: str = "30301") -> httpx.Response:

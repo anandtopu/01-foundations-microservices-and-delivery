@@ -1,0 +1,154 @@
+"""IBM i CSV export -> validated rows. Pure functions: no SFTP, no database (spec M3).
+
+Every legacy quirk lives here, in Pydantic `mode="before"` validators: space-padded fields,
+CYYMMDD dates, one-letter status codes, Windows-1252 bytes. The rest of the gateway sees only clean,
+typed `ShipmentRow`s.
+
+`ShipmentRow` and `parse_cyymmdd` are the spec's code, plus lab additions marked "lab".
+"""
+
+import csv
+import re
+from collections.abc import Iterator
+from dataclasses import dataclass
+from datetime import date
+from decimal import Decimal
+from typing import Literal
+
+from pydantic import BaseModel, Field, ValidationError, field_validator
+
+STATUS = {"P": "picked", "L": "loaded", "T": "in_transit", "D": "delivered", "X": "exception"}
+
+# The export's header, in order. SHIPPER_CODE is decision A (see fixtures/csv/README.md).
+COLUMNS = ("SHIPMENT_ID", "ORDER_NO", "SHIPPER_CODE", "STATUS", "SHIP_DATE", "WEIGHT_LB")
+FIELDS = ("shipment_id", "order_no", "shipper_code", "status", "ship_date", "weight_lb")
+
+
+def parse_cyymmdd(raw: str) -> date:
+    """IBM i CYYMMDD: C=0 -> 19xx, C=1 -> 20xx. '1260924' -> 2026-09-24."""
+    v = raw.strip().zfill(7)
+    # lab: exactly C + 6 digits, C in {0, 1}. int() alone accepts " 1" and "+1", and C=2..9 would
+    # silently produce 21xx..28xx dates (PR #2 review).
+    if not re.fullmatch(r"[01][0-9]{6}", v):
+        raise ValueError(f"not a CYYMMDD date: {raw!r}")
+    return date(1900 + int(v[0]) * 100 + int(v[1:3]), int(v[3:5]), int(v[5:7]))
+
+
+class ShipmentRow(BaseModel):
+    shipment_id: str
+    order_no: str
+    # --- lab addition (decision A): which shipper owns the row; becomes shipments.client_id ---
+    shipper_code: str
+    status: Literal["picked", "loaded", "in_transit", "delivered", "exception"]
+    ship_date: date
+    # (lab: constraints mirror numeric(12,2) CHECK >= 0, so a bad weight dead-letters one row
+    #  instead of failing the whole batch's INSERT)
+    weight_lb: Decimal = Field(ge=0, max_digits=12, decimal_places=2)
+
+    # (lab: shipper_code added to the spec's list, so a blank owner is rejected like a blank key)
+    @field_validator("shipment_id", "order_no", "shipper_code", mode="before")
+    @classmethod
+    def strip_padding(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("blank key field")
+        return v
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def map_status(cls, v: str) -> str:
+        try:
+            return STATUS[v.strip().upper()]
+        except KeyError:
+            raise ValueError(f"unknown status code {v!r}") from None
+
+    @field_validator("ship_date", mode="before")
+    @classmethod
+    def ibm_date(cls, v: str) -> date:
+        return parse_cyymmdd(v)
+
+    # --- lab addition: numeric fields arrive right-aligned (" 845.00"); plain digits only, since
+    #     Decimal() alone would also accept "1e2", "1_000" and "+5" (PR #2 review) ---
+    @field_validator("weight_lb", mode="before")
+    @classmethod
+    def strip_number(cls, v: str) -> str:
+        v = v.strip()
+        if not re.fullmatch(r"[0-9]+(\.[0-9]+)?", v):
+            raise ValueError(f"not a plain decimal number: {v!r}")
+        return v
+
+
+@dataclass(frozen=True, slots=True)
+class GoodRow:
+    line_no: int
+    row: ShipmentRow
+    raw: str  # kept so a row refused later (e.g. an owner change) can still be dead-lettered
+
+
+@dataclass(frozen=True, slots=True)
+class DeadRow:
+    line_no: int
+    raw: str
+    reason: str
+
+
+class FileRejected(Exception):
+    """The whole file is unusable (wrong encoding or header); no row can be trusted."""
+
+
+def reason_of(err: ValidationError) -> str:
+    """E.g. "status: unknown status code 'Q'": the field, then the message sans Pydantic prefix."""
+    parts = []
+    for e in err.errors():
+        field = ".".join(str(p) for p in e["loc"]) or "row"
+        parts.append(f"{field}: {e['msg'].removeprefix('Value error, ')}")
+    return "; ".join(parts)
+
+
+def decode(raw: bytes) -> str:
+    """The IBM i job writes Windows-1252. Bytes cp1252 leaves undefined (0x81, 0x8D, 0x8F, 0x90,
+    0x9D) mean the file is not what we think it is, so reject it rather than guess."""
+    try:
+        return raw.decode("cp1252")
+    except UnicodeDecodeError as e:
+        raise FileRejected(f"not valid Windows-1252 at byte {e.start}") from None
+
+
+def parse_export(raw: bytes, *, start_after: int = 1) -> Iterator[GoodRow | DeadRow]:
+    """Yield one result per data line, in file order. Line numbers are physical lines, header = 1.
+
+    `start_after` skips lines already committed (the resume checkpoint). CPYTOIMPF never emits a
+    newline inside a quoted field, so one physical line is one record; that keeps `line_no` and
+    `raw` exact for the ops team.
+    """
+    # Split on LF only (CRLF and LF both work). str.splitlines() would also split on \x0b, \x0c,
+    # \x1c-\x1e and a bare \r, which can sit inside a field and would shift every later line_no.
+    lines = [line.removesuffix("\r") for line in decode(raw).split("\n")]
+    if lines and lines[-1] == "":
+        lines.pop()  # the file's final newline
+    if not lines:
+        raise FileRejected("empty file")
+    header = tuple(h.strip().upper() for h in next(csv.reader([lines[0]])))
+    if header != COLUMNS:
+        raise FileRejected(f"unexpected header {header!r}; expected {COLUMNS!r}")
+
+    for line_no, line in enumerate(lines[1:], start=2):
+        if line_no <= start_after or not line.strip():
+            continue
+        if "\x00" in line:  # Postgres text cannot store NUL: refuse the line, not the batch
+            yield DeadRow(line_no, line, "line contains a NUL byte")
+            continue
+        try:
+            values = next(csv.reader([line]))
+        except csv.Error as err:  # e.g. a bare \r inside an unquoted field
+            yield DeadRow(line_no, line, f"unparseable CSV line: {err}")
+            continue
+        if len(values) != len(FIELDS):
+            yield DeadRow(line_no, line, f"expected {len(FIELDS)} fields, got {len(values)}")
+            continue
+        try:
+            row = ShipmentRow.model_validate(dict(zip(FIELDS, values, strict=True)))
+        except ValidationError as err:
+            yield DeadRow(line_no, line, reason_of(err))
+        else:
+            yield GoodRow(line_no, row, line)

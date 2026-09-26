@@ -2,7 +2,7 @@
 
 A learning build from the FDE Onboarding Handbook. A Python 3.14 FastAPI gateway sits in front of a legacy AS/400 SFTP drop and a fragile SOAP rate-quote service. It provides idempotent quotes, a bulkhead, retries and a circuit breaker, signed webhooks through an outbox, and RFC 9457 errors.
 
-**Status:** M0 (toolchain), M1 (OpenAPI 3.1 contract) and M2 (legacy stand-ins) done; see [`docs/BUILD_LOG.md`](docs/BUILD_LOG.md). The build is done in Claude Code cloud sessions, following [`docs/CLOUD_BUILD_PROMPT.md`](docs/CLOUD_BUILD_PROMPT.md).
+**Status:** M0 (toolchain), M1 (OpenAPI 3.1 contract), M2 (legacy stand-ins), M3 (CSV ingestion) and M4 (SOAP adapter) done; see [`docs/BUILD_LOG.md`](docs/BUILD_LOG.md). The build is done in Claude Code cloud sessions, following [`docs/CLOUD_BUILD_PROMPT.md`](docs/CLOUD_BUILD_PROMPT.md).
 
 | Path | What it is |
 |---|---|
@@ -91,6 +91,42 @@ Open an SFTP session as the gateway (the M2 gate). Expect `sftp>`; `put` fails w
 
 ```bash
 sftp -i secrets/gateway_ed25519 -P 2222 -o UserKnownHostsFile=secrets/known_hosts -o HostKeyAlias=sftp -o StrictHostKeyChecking=yes gateway@localhost:/outbound/shipments
+```
+
+Apply the database migrations from the host (M8 moves this into the gateway image):
+
+```bash
+make migrate-local
+```
+
+Run one poller cycle: it ingests every CSV whose `.done` exists (the M3 gate expects 3 shipments, 2 dead letters):
+
+```bash
+make poll-once
+```
+
+Check the result with the spec's query:
+
+```bash
+docker compose exec postgres psql -U gateway -d gateway -c "select count(*) from shipments; select reason from dead_letters;"
+```
+
+Or keep the poller running every 5 s while you drop files from another terminal:
+
+```bash
+make poll-local
+```
+
+Run the SOAP adapter tests (the M4 gate; the golden tests need nothing running, the live ones use the mock):
+
+```bash
+uv run pytest tests/soap -q
+```
+
+Re-record the SOAP golden fixtures from the mock (only when the mock's responses change):
+
+```bash
+uv run python tests/soap/record_fixtures.py
 ```
 
 List every other target:
