@@ -1,0 +1,67 @@
+[project]
+name = "meridian-gateway"
+version = "0.1.0"
+description = "P01 Legacy Integration Gateway: REST, idempotent quotes and signed webhooks in front of an AS/400 SFTP drop and a SOAP 1.1 service"
+requires-python = ">=3.14"
+# Exact pins (spec section 4). FastAPI is still 0.x, so any minor bump may break us; uv.lock pins the rest of the tree.
+dependencies = [
+    "fastapi==0.141.1",
+    "pydantic==2.13.5",
+    "pydantic-settings==2.15.0",
+    "uvicorn[standard]==0.54.0",
+    "httpx==0.28.1",
+    "asyncssh==2.24.0",
+    "psycopg[binary,pool]==3.3.6",
+    "defusedxml==0.7.1",
+    "opentelemetry-api==1.45.0",
+    "opentelemetry-sdk==1.45.0",
+    "opentelemetry-exporter-otlp-proto-grpc==1.45.0",
+    "opentelemetry-distro==0.66b0",
+    "opentelemetry-instrumentation-fastapi==0.66b0",
+    "opentelemetry-instrumentation-httpx==0.66b0",
+    "opentelemetry-instrumentation-psycopg==0.66b0",
+]
+
+[dependency-groups]
+# Installed by `uv sync` for local work, left out of the image with `uv sync --no-dev`.
+# Schemathesis and pip-audit run through `uvx` so their dependency trees never mix with ours.
+dev = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "pytest-cov==7.1.0",
+    "ruff==0.16.9",
+    "mypy==2.3.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.19,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+# Distribution is "meridian-gateway"; the import package is "gateway" (src/gateway).
+module-name = "gateway"
+
+[tool.pytest]
+# pytest 9 reads native TOML config from [tool.pytest] (no ini_options shim needed).
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = ["-ra", "--strict-markers", "--import-mode=importlib"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+# spec/ is the read-only source of truth; ruff 0.16 would otherwise reformat its Markdown code samples.
+extend-exclude = ["spec"]
+
+[tool.ruff.lint]
+# S = flake8-bandit (security), used by the section 7 security row.
+select = ["E", "F", "W", "I", "B", "UP", "S", "ASYNC", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]  # assert is the point of a test
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+plugins = ["pydantic.mypy"]
+mypy_path = "src"

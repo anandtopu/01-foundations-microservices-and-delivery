@@ -2,7 +2,7 @@
 
 A learning build from the FDE Onboarding Handbook. A Python 3.14 FastAPI gateway sits in front of a legacy AS/400 SFTP drop and a fragile SOAP rate-quote service. It provides idempotent quotes, a bulkhead, retries and a circuit breaker, signed webhooks through an outbox, and RFC 9457 errors.
 
-**Status:** not built yet. The build is done in Claude Code cloud sessions, following [`docs/CLOUD_BUILD_PROMPT.md`](docs/CLOUD_BUILD_PROMPT.md).
+**Status:** M0 (toolchain and workspace) done; see [`docs/BUILD_LOG.md`](docs/BUILD_LOG.md). The build is done in Claude Code cloud sessions, following [`docs/CLOUD_BUILD_PROMPT.md`](docs/CLOUD_BUILD_PROMPT.md).
 
 | Path | What it is |
 |---|---|
@@ -12,4 +12,60 @@ A learning build from the FDE Onboarding Handbook. A Python 3.14 FastAPI gateway
 | [`CLAUDE.md`](CLAUDE.md) | Environment facts, native fallback and safety rules for Claude Code |
 | [`scripts/cloud-setup.sh`](scripts/cloud-setup.sh) | Idempotent toolchain setup for the cloud VM |
 | [`docs/CLOUD_BUILD_PROMPT.md`](docs/CLOUD_BUILD_PROMPT.md) | Prerequisites, the kickoff prompt and the resume prompt |
-| `docs/BUILD_LOG.md` | Step-by-step setup/build/deploy/test record (created during the build) |
+| [`docs/BUILD_LOG.md`](docs/BUILD_LOG.md) | Step-by-step setup/build/deploy/test record, one section per milestone |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | The architecture as built (diverges from the spec only where recorded) |
+
+## Quick start (from zero)
+
+These steps grow with each milestone. On a fresh Claude Code cloud VM or any Ubuntu 24.04 x86_64 host:
+
+Install the toolchain (uv 0.12.19, Python 3.14.7, k6, and start dockerd if it is installed but stopped):
+
+```bash
+bash scripts/cloud-setup.sh
+```
+
+Install the locked dependencies into `.venv`:
+
+```bash
+uv sync --locked
+```
+
+Check that the core libraries import (the M0 gate):
+
+```bash
+uv run python -c "import fastapi, pydantic, httpx, asyncssh, psycopg; print('ok')"
+```
+
+Run lint, type checks and tests:
+
+```bash
+make check
+```
+
+Create your local environment file (gitignored):
+
+```bash
+cp .env.example .env
+```
+
+List every other target:
+
+```bash
+make help
+```
+
+## Layout
+
+```text
+contracts/openapi.yaml          design-first OpenAPI 3.1 contract (M1)
+src/gateway/                    the importable package (src layout)
+  api/  ingest/  soap/  webhooks/
+migrations/                     additive-only SQL
+mocks/{sftp,soap,webhook-sink}/ legacy stand-ins (M2)
+fixtures/csv/                   golden and generated CSV files
+tests/{unit,soap,integration,security}/
+load/                           k6 scripts
+docs/{BUILD_LOG.md,ARCHITECTURE.md,adr/,runbooks/}
+secrets/                        gitignored: SSH keys, pinned known_hosts
+```
