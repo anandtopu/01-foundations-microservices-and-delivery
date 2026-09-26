@@ -5,14 +5,17 @@ import base64
 import hashlib
 import hmac
 import secrets
+import ssl
 import time
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import httpx
 import pytest
 
 SOAP = "http://localhost:8080"
-SINK = "http://localhost:9000"
+SINK = "https://localhost:9000"  # M7: HTTPS only, cert from the lab CA (`make certs`)
+LAB_CA = Path(__file__).parents[2] / "secrets" / "webhook-ca.crt"
 ENVELOPE = """<?xml version="1.0" encoding="utf-8"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
                   xmlns:rq="urn:meridian:ratequote:v2">
@@ -25,8 +28,9 @@ ENVELOPE = """<?xml version="1.0" encoding="utf-8"?>
 
 def reachable(url: str) -> bool:
     try:
-        return httpx.get(f"{url}/__health", timeout=1).status_code == 200
-    except httpx.HTTPError:
+        verify = ssl.create_default_context(cafile=LAB_CA) if url.startswith("https") else True
+        return httpx.get(f"{url}/__health", timeout=1, verify=verify).status_code == 200
+    except httpx.HTTPError, OSError:
         return False
 
 
@@ -106,7 +110,9 @@ def sign(secret: str, msg_id: str, ts: int, body: bytes) -> str:
 def sink() -> httpx.Client:
     if not reachable(SINK):
         pytest.skip("webhook-sink not running (make mocks)")
-    client = httpx.Client(base_url=SINK, timeout=5)
+    client = httpx.Client(
+        base_url=SINK, timeout=5, verify=ssl.create_default_context(cafile=LAB_CA)
+    )
     client.post("/__reset")
     return client
 

@@ -357,3 +357,115 @@ async def test_wrong_host_key_is_refused(db: AsyncConnection, tmp_path: Path) ->
     )
     with pytest.raises(asyncssh.HostKeyNotVerifiable):
         await poller.poll_once(cfg)
+
+
+# --- M7: the transactional outbox ----------------------------------------------------------------
+
+
+async def subscribe(
+    conn: AsyncConnection, client: str, types: list[str], status: str = "active"
+) -> str:
+    sub_id = str(__import__("uuid").uuid4())
+    await conn.execute(
+        """INSERT INTO webhook_subscriptions
+               (subscription_id, client_id, url, event_types, secret, status)
+           VALUES (%s, %s, 'https://example.test/hook', %s, 'whsec_dGVzdA==', %s)""",
+        (sub_id, client, types, status),
+    )
+    await conn.commit()
+    return sub_id
+
+
+async def deliveries(conn: AsyncConnection) -> list[tuple[str, str, dict[str, Any]]]:
+    cur = await conn.execute(
+        """SELECT s.client_id, d.event_type, d.payload FROM webhook_deliveries d
+             JOIN webhook_subscriptions s USING (subscription_id)
+            ORDER BY d.payload->'data'->>'shipment_id'"""
+    )
+    rows = await cur.fetchall()
+    await conn.commit()
+    return rows
+
+
+async def test_no_subscription_no_deliveries(db: AsyncConnection) -> None:
+    raw = (CSV / "SHPSTS_20260924_0915.csv").read_bytes()
+    res = await ingest_bytes(db, remote("a.csv", raw), raw, batch_size=1000)
+    assert res.events == 0
+    assert await deliveries(db) == []
+
+
+async def test_created_events_fan_out_to_the_owners_subscriptions_only(db: AsyncConnection) -> None:
+    await subscribe(db, "ACME", ["shipment.created", "shipment.status_changed"])
+    await subscribe(db, "BOLT", ["shipment.status_changed"])  # not interested in "created"
+    await subscribe(db, "ACME", ["shipment.created"], status="disabled")  # 410'd earlier
+    raw = (CSV / "SHPSTS_20260924_0915.csv").read_bytes()  # ACME x2, BOLT x1
+    res = await ingest_bytes(db, remote("a.csv", raw), raw, batch_size=1000)
+    rows = await deliveries(db)
+    assert res.events == 2
+    assert [(c, t) for c, t, _ in rows] == [("ACME", "shipment.created")] * 2
+    payload = rows[0][2]
+    assert set(payload) == {"type", "timestamp", "data"}  # contract ShipmentEvent
+    assert payload["data"] | {"updated_at": "x"} == {
+        "shipment_id": "SHP0000101",
+        "order_no": "ORD-77001",
+        "status": "picked",
+        "ship_date": "2026-09-24",
+        "weight_lb": "1200.50",
+        "updated_at": "x",
+        "previous_status": None,
+    }
+
+
+async def test_status_change_event_carries_the_previous_status(db: AsyncConnection) -> None:
+    await subscribe(db, "ACME", ["shipment.status_changed"])
+    raw = (CSV / "SHPSTS_20260924_0915.csv").read_bytes()
+    await ingest_bytes(db, remote("a.csv", raw), raw, batch_size=1000)
+    assert await deliveries(db) == []  # only "created" happened, and nobody asked for it
+    changed = raw.replace(
+        b'"SHP0000102","ORD-77002 ","ACME  ","T"', b'"SHP0000102","ORD-77002 ","ACME  ","D"'
+    )
+    renamed = changed.replace(b'"ORD-77001 "', b'"ORD-77001X"')  # data change, same status
+    await ingest_bytes(db, remote("b.csv", renamed), renamed, batch_size=1000)
+    rows = await deliveries(db)
+    assert len(rows) == 1  # the order_no correction is not an event
+    _, event_type, payload = rows[0]
+    assert event_type == "shipment.status_changed"
+    assert (payload["data"]["previous_status"], payload["data"]["status"]) == (
+        "in_transit",
+        "delivered",
+    )
+
+
+async def test_outbox_rows_commit_exactly_once_with_their_batch(
+    db: AsyncConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The outbox guarantee: a crash inside batch 3 leaves exactly the events of batches 1-2; the
+    resume adds exactly the rest. No lost and no duplicate events."""
+    await subscribe(db, "ACME", ["shipment.created"])
+    await subscribe(db, "BOLT", ["shipment.created"])
+    await subscribe(db, "CRUX", ["shipment.created"])
+    raw = generate(2500, bad_every=50)  # 2,450 good rows, each a new shipment
+    f = remote("big.csv", raw)
+    original = poller.commit_batch
+    calls = 0
+
+    async def crash_in_third_batch(conn: AsyncConnection, *args: Any) -> None:
+        nonlocal calls
+        calls += 1
+        await original(DiesAfterUpsert(conn) if calls == 3 else conn, *args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(poller, "commit_batch", crash_in_third_batch)
+    with pytest.raises(Crash):
+        await ingest_bytes(db, f, raw, batch_size=1000)
+    assert await scalar(db, "SELECT count(*) FROM webhook_deliveries") == 1960
+    monkeypatch.setattr(poller, "commit_batch", original)
+    async with await AsyncConnection.connect(TEST_URL) as fresh:
+        await ingest_bytes(fresh, f, raw, batch_size=1000)
+        assert await scalar(fresh, "SELECT count(*) FROM webhook_deliveries") == 2450
+        assert (
+            await scalar(
+                fresh,
+                "SELECT count(DISTINCT payload->'data'->>'shipment_id') FROM webhook_deliveries",
+            )
+            == 2450
+        )

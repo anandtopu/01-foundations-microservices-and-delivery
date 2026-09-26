@@ -29,6 +29,7 @@ from gateway.auth import Principal, shipper_principal
 from gateway.errors import ProblemError
 from gateway.resilience import Bulkhead, CircuitBreaker, CircuitOpenError, retry_full_jitter
 from gateway.soap.client import UpstreamInvalidResponse, get_rate_quote
+from gateway.webhooks import outbox
 
 # [0-9], never \d: in Python regexes \d also matches other scripts' digits ("٣٠٣٠١"), which the
 # contract's ECMA-262 pattern does not, and which Meridian's AS/400 would not understand.
@@ -202,6 +203,9 @@ async def create_rate_quote(
             # result. Log a hash, not the key: keys are client-chosen and may carry identifiers.
             digest = hashlib.sha256(idempotency_key.encode()).hexdigest()[:12]
             log.warning("idempotency key sha256:%s was taken over while we worked", digest)
+        else:
+            # M7 outbox: the event commits with the quote it describes (one per replayable quote).
+            await outbox.enqueue(conn, [outbox.Event(who.client_id, "rate_quote.completed", quote)])
     return quote_response(quote)
 
 

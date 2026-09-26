@@ -24,6 +24,7 @@ import logging
 import posixpath
 from dataclasses import dataclass, field
 from itertools import islice
+from typing import Any
 
 import asyncssh
 import psycopg
@@ -33,6 +34,7 @@ from psycopg.types.json import Jsonb
 
 from gateway.config import Settings, get_settings
 from gateway.ingest.model import DeadRow, FileRejected, GoodRow, parse_export
+from gateway.webhooks import outbox
 
 log = logging.getLogger("gateway.ingest")
 
@@ -53,15 +55,16 @@ class IngestResult:
     rows_ok: int = 0
     rows_dead: int = 0
     rows_superseded: int = 0  # same shipment_id again later in the same batch; the later line won
-    inserted: list[str] = field(default_factory=list)  # new shipment IDs (M7 will emit events)
+    inserted: list[str] = field(default_factory=list)  # new shipment IDs
     updated: list[str] = field(default_factory=list)  # shipment IDs whose data changed
+    events: int = 0  # webhook deliveries queued in the same transactions (M7 outbox)
 
 
 # One statement per batch: arrays in, one row per changed shipment out. The WHERE clause makes a
 # re-delivered identical row a no-op, so updated_at (the pagination key) only moves on real change.
-# (xmax = 0) is true for a freshly inserted row and false for an updated one. It relies on a
-# Postgres implementation detail (an inserted tuple has no deleting transaction yet); it is widely
-# used and test_only_changed_rows_move_updated_at pins the behaviour.
+# PostgreSQL 18's RETURNING old/new gives the previous status (for shipment.status_changed) and
+# tells inserts from updates (old row absent) in the same statement. It replaced M3's
+# (xmax = 0) trick, which relied on an undocumented implementation detail.
 # Two rules the caller must keep: each shipment_id appears at most once per statement (Postgres
 # refuses to update a row twice in one INSERT ... ON CONFLICT), and client_id never changes, which
 # is why it is neither SET nor compared (commit_batch dead-letters owner changes first).
@@ -77,7 +80,9 @@ ON CONFLICT (shipment_id) DO UPDATE
  WHERE (s.order_no, s.status, s.ship_date, s.weight_lb)
        IS DISTINCT FROM
        (EXCLUDED.order_no, EXCLUDED.status, EXCLUDED.ship_date, EXCLUDED.weight_lb)
-RETURNING s.shipment_id, (s.xmax = 0) AS inserted
+RETURNING new.shipment_id, new.client_id, new.order_no, new.status, new.ship_date,
+          new.weight_lb, new.updated_at, old.status AS previous_status,
+          (old.shipment_id IS NULL) AS inserted
 """
 
 OWNERS = "SELECT shipment_id, client_id FROM shipments WHERE shipment_id = ANY(%s) FOR UPDATE"
@@ -179,6 +184,69 @@ def source(file_name: str, line_no: int, raw: str) -> dict[str, object]:
     return {"file_name": file_name, "line_no": line_no, "raw": raw.replace("\x00", "\\x00")}
 
 
+async def apply_rows(
+    conn: AsyncConnection, rows: list[GoodRow], source_file: str
+) -> tuple[list[tuple[str, bool]], list[DeadRow], int]:
+    """Owner check, upsert and outbox for validated rows, inside the CALLER's transaction.
+
+    Returns (changed [(shipment_id, inserted)], refused rows as dead letters, events queued).
+    Shared by the poller and the dead-letter replay (M7), so both follow the same rules.
+    """
+    # The last line for a shipment wins; a dict keeps one entry per ID (and the UPSERT needs that).
+    latest: dict[str, GoodRow] = {}
+    for g in rows:
+        latest[g.row.shipment_id] = g
+    refused: list[DeadRow] = []
+    if latest:
+        # Tenant boundary (section 9): a file may not hand a shipment to another shipper.
+        # FOR UPDATE holds these rows until the batch commits, so the check cannot go stale.
+        cur = await conn.execute(OWNERS, (list(latest),))
+        for shipment_id, owner in await cur.fetchall():
+            g = latest[shipment_id]
+            if owner != g.row.shipper_code:
+                del latest[shipment_id]
+                reason = f"owner change refused: {owner!r} -> {g.row.shipper_code!r}"
+                refused.append(DeadRow(g.line_no, g.raw, reason))
+    good = [g.row for g in latest.values()]
+    if not good:
+        return [], refused, 0
+    cur = await conn.execute(
+        UPSERT,
+        {
+            "file": source_file,
+            "ids": [r.shipment_id for r in good],
+            "clients": [r.shipper_code for r in good],
+            "orders": [r.order_no for r in good],
+            "statuses": [r.status for r in good],
+            "dates": [r.ship_date for r in good],
+            "weights": [r.weight_lb for r in good],
+        },
+    )
+    changed = await cur.fetchall()
+    events = [e for row in changed if (e := shipment_event(row)) is not None]
+    # The outbox insert rides in the same transaction as the upsert (spec M7).
+    queued = await outbox.enqueue(conn, events)
+    return [(row[0], row[8]) for row in changed], refused, queued
+
+
+def shipment_event(row: tuple[Any, ...]) -> outbox.Event | None:
+    """shipment.created for an insert, shipment.status_changed when the status moved, else none
+    (an order_no or weight correction is not an event in the contract)."""
+    sid, client, order_no, status, ship_date, weight, updated_at, previous, inserted = row
+    if not inserted and status == previous:
+        return None
+    data = {
+        "shipment_id": sid,
+        "order_no": order_no,
+        "status": status,
+        "ship_date": ship_date.isoformat(),
+        "weight_lb": f"{weight:f}",  # decimal as a string (contract)
+        "updated_at": updated_at.isoformat(),
+        "previous_status": None if inserted else previous,
+    }
+    return outbox.Event(client, "shipment.created" if inserted else "shipment.status_changed", data)
+
+
 async def commit_batch(
     conn: AsyncConnection,
     file_id: int,
@@ -187,53 +255,26 @@ async def commit_batch(
     result: IngestResult,
 ) -> None:
     dead = [r for r in batch if isinstance(r, DeadRow)]
-    # The last line for a shipment wins; a dict keeps one entry per ID (and the UPSERT needs that).
-    latest: dict[str, GoodRow] = {}
-    for g in batch:
-        if isinstance(g, GoodRow):
-            latest[g.row.shipment_id] = g
-    superseded = sum(isinstance(r, GoodRow) for r in batch) - len(latest)
+    goods = [r for r in batch if isinstance(r, GoodRow)]
+    superseded = len(goods) - len({g.row.shipment_id for g in goods})
     async with conn.transaction():
-        if latest:
-            # Tenant boundary (section 9): a file may not hand a shipment to another shipper.
-            # FOR UPDATE holds these rows until the batch commits, so the check cannot go stale.
-            cur = await conn.execute(OWNERS, (list(latest),))
-            for shipment_id, owner in await cur.fetchall():
-                g = latest[shipment_id]
-                if owner != g.row.shipper_code:
-                    del latest[shipment_id]
-                    reason = f"owner change refused: {owner!r} -> {g.row.shipper_code!r}"
-                    dead.append(DeadRow(g.line_no, g.raw, reason))
-        good = [g.row for g in latest.values()]
-        if good:
-            cur = await conn.execute(
-                UPSERT,
-                {
-                    "file": file_name,
-                    "ids": [r.shipment_id for r in good],
-                    "clients": [r.shipper_code for r in good],
-                    "orders": [r.order_no for r in good],
-                    "statuses": [r.status for r in good],
-                    "dates": [r.ship_date for r in good],
-                    "weights": [r.weight_lb for r in good],
-                },
-            )
-            changed = await cur.fetchall()
-        else:
-            changed = []
+        changed, refused, queued = await apply_rows(conn, goods, file_name)
+        dead += refused
         for d in dead:
             await conn.execute(
                 DEAD, (d.reason, Jsonb(source(file_name, d.line_no, d.raw)), file_id, d.line_no)
             )
         # The checkpoint commits with the rows it describes: that is the exactly-once guarantee.
+        rows_ok = len(goods) - superseded - len(refused)
         await conn.execute(
             """UPDATE ingested_files SET last_line = %s, rows_ok = rows_ok + %s,
                       rows_dead = rows_dead + %s WHERE file_id = %s""",
-            (batch[-1].line_no, len(good), len(dead), file_id),
+            (batch[-1].line_no, rows_ok, len(dead), file_id),
         )
-    result.rows_ok += len(good)
+    result.rows_ok += rows_ok
     result.rows_dead += len(dead)
     result.rows_superseded += superseded
+    result.events += queued
     for shipment_id, inserted in changed:
         (result.inserted if inserted else result.updated).append(shipment_id)
     for d in dead:

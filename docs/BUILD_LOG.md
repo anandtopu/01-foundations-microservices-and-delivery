@@ -836,3 +836,115 @@ The security reviewer confirmed tenant isolation: there was no cross-shipper rep
 - **A tail-latency claim needs a sample and a baseline:** 300 calls, and a no-database control, rather than one lucky run.
 
 ---
+
+---
+
+## M7 — Signed webhook fan-out   (2026-09-26, session 3)
+
+**Goal / requirement served:** FR-5 (shippers subscribe to `shipment.created`, `shipment.status_changed` and `rate_quote.completed`), FR-6 (Standard Webhooks signatures, retries with full jitter, `410` disables, dead letter after 72 h) and FR-7 (ops list and replay dead letters). It also covers the section 9 rows *SSRF* (resolve and refuse non-public addresses before every attempt), *Tampering* (HMAC over the exact bytes sent) and *Repudiation* (every replay audited).
+
+**What we built:**
+- `migrations/0003_webhooks.sql`:
+  - `webhook_subscriptions`: https-only URL and `whsec_` secret as `CHECK`s, `active` or `disabled` with a reason;
+  - `webhook_deliveries`: the outbox. `delivery_id` (`uuidv7()`) is the stable `webhook-id`. It has a status, attempts, `next_attempt_at`, a `window_start` for the max age, and a partial index on due rows;
+  - `dead_letters.delivery_id`, with a unique index on *open* webhook dead letters;
+  - `dead_letter_replays`: the audit trail.
+- `src/gateway/webhooks/signing.py` and `ssrf.py`: the spec's `sign`/`verify` and `assert_public_https`, verbatim. `ssrf.guard()` adds the dev-only exact-hostname allowance (difference 37).
+- `src/gateway/webhooks/outbox.py`: `enqueue(conn, events)`, one `INSERT … SELECT` that fans each event out to the client's **active** subscriptions for that type, on the caller's own transaction.
+- `src/gateway/ingest/poller.py`: `apply_rows()` (owner check → upsert → outbox), shared by the poller and the dead-letter replay. The upsert now uses Postgres 18 `RETURNING old.*, new.*` to tell `created` from `status_changed` (difference 41).
+- `src/gateway/api/rate_quotes.py`: `rate_quote.completed` enqueued in the transaction that stores the quote (difference 43).
+- `src/gateway/api/webhooks.py`: `POST`/`GET`/`DELETE /v1/webhook-subscriptions`. The SSRF check runs at creation (`422 webhook-url-not-allowed`). A 256-bit secret is returned **once**; BOLA gives `404`.
+- `src/gateway/api/dead_letters.py`: `GET /v1/dead-letters` (ops only, filter-bound opaque cursor) and `POST /v1/dead-letters/{id}:replay`:
+  - a row is re-validated, then applied (`200`);
+  - a webhook is re-queued (`202`);
+  - a conflict gives `409`, a rejected replay `422`;
+  - every attempt is audited.
+- `src/gateway/webhooks/dispatcher.py`: the worker (`make dispatch-local`, or `--once`).
+- `make certs` + `compose.yaml`: the sink now serves HTTPS with a lab CA that only the dispatcher trusts (difference 38).
+- Tests:
+  - `tests/unit/test_webhooks_signing_ssrf.py` (33): the published test vector, tampering, the replay window, rotation, agreement with the lab sink's verifier, and the SSRF table;
+  - `tests/integration/test_webhooks_api.py` (19);
+  - `tests/integration/test_dispatcher.py` (12);
+  - 4 outbox tests in `test_ingest.py`, including exactly-once events across a crash;
+  - `tests/integration/conftest.py`: the shared API test database.
+
+**How it works:**
+- **The outbox is the whole trick.** The delivery rows are inserted by the *same transaction* that upserts the shipment (or stores the quote). If the batch rolls back, the events vanish with it; if it commits, they're durable before anyone tries to send them. There's no "we changed the row but crashed before publishing" window, and no dual write to a broker.
+- **Event choice comes from the database, not from a guess.** `RETURNING old.status, (old.shipment_id IS NULL) AS inserted` says exactly what the upsert did:
+  - an insert → `shipment.created`;
+  - a changed status → `shipment.status_changed` with `previous_status`;
+  - a no-op re-ingest → no event at all.
+- **The claim is a lease, not a held lock.** `FOR UPDATE SKIP LOCKED` picks due rows that no other replica is claiming, and the same `UPDATE` pushes `next_attempt_at` 60 s out; then it **commits** before any HTTP call. A dispatcher that dies mid-send leaves rows that become due again after 60 s. That's at-least-once, and receivers de-duplicate on `webhook-id`, which stays the same across retries and replays.
+- **Signing is over the exact bytes sent:** canonical JSON (sorted keys, compact, UTF-8), signed as `{webhook-id}.{webhook-timestamp}.{body}`. A retry re-signs with a fresh timestamp (the 5-minute replay window) but sends identical bytes.
+- **Every attempt re-checks SSRF.** DNS answers change after a subscription is created (DNS rebinding), so creation-time validation isn't enough. Redirects aren't followed (a `302` to `169.254.169.254` is just a failed attempt), and one `asyncio.timeout(5)` bounds the whole request.
+- **Outcomes:**
+  - `2xx` → delivered, and any open dead letter for it is resolved;
+  - `410` → the subscription is disabled and its pending rows cancelled, so no more requests go to an endpoint that said it's gone;
+  - anything else → retry after `uniform(0, min(6 h, 30 s × 2^n))`, or, once `WEBHOOK_MAX_AGE` has passed since `window_start`, `dead` plus a `dead_letters` row.
+- **Replay re-queues the *same* delivery** (same `webhook-id`, `attempts` 0, a fresh window) and answers `202`: queued isn't delivered. The dead letter is resolved by the dispatcher when the delivery really lands. The audit row commits *before* any `409`/`422` is raised, so failed replays leave a trace too.
+
+**Commands run, in order:**
+{{COMMANDS}}
+
+**Verification:**
+{{VERIFICATION}}
+
+**Mutation check** (each applied, run, then restored):
+
+| Mutation | Caught by |
+|---|---|
+| No SSRF check at subscription creation | `test_create_refuses_non_public_targets` (all 6 cases) |
+| No SSRF check at send time | `test_ssrf_is_checked_again_at_send_time` |
+| Backoff sleeps the ceiling (no jitter) | `test_backoff_doubles_from_30s_to_a_6h_cap` |
+| A delivery doesn't resolve its dead letter | `test_max_age_dead_letters_and_replay_delivers` |
+| `410` doesn't cancel the subscription's queue | `test_410_disables_the_subscription_and_cancels_its_queue` |
+| A rejected replay raises before its audit row | `test_replay_row_applies_once_it_validates` |
+| The outbox ignores `status = 'active'` | `test_created_events_fan_out_to_the_owners_subscriptions_only` |
+| `FOR UPDATE` without `SKIP LOCKED` | **survived at first**, see "What broke" 3; now `test_a_second_dispatcher_does_not_wait_for_rows_being_claimed` |
+
+**What broke and how we fixed it:**
+1. *The M2 sink tests had been skipping silently, and the dispatcher couldn't connect to the new HTTPS sink.*
+   - *Symptom:* `ssl.SSLCertVerificationError: … CA cert does not include key usage extension`.
+   - *Hypothesis:* the lab CA was wrong, not the sink cert.
+   - *Evidence:* `openssl verify` accepted the chain, but Python 3.14's default context sets `VERIFY_X509_STRICT`, which requires `keyUsage` on a CA.
+   - *Fix:* the CA is generated with `keyUsage=critical,keyCertSign,cRLSign`, and the leaf with SAN, EKU `serverAuth`, SKI/AKI. After regenerating the certs, 6 of 6 sink tests passed.
+   - *Lesson:* `openssl verify` isn't the client. Test with the TLS stack that will actually connect.
+2. *The spec's gate grep counts more than this subscription.*
+   - `docker compose logs webhook-sink --since 15m | grep -c "signature=valid"` includes the M2 sink tests' own traffic (ids `msg_…`, including 6 *deliberate* forgeries that show up as `invalid`).
+   - I split the count by `webhook-id` shape: dispatcher deliveries have UUID ids.
+   - Phase 1: **128 of 128 valid**, which matches the 128 `delivered` rows in the database.
+3. *Removing `SKIP LOCKED` survived the concurrency test.*
+   - That was a correct result, not a flaky one. With a plain `FOR UPDATE`, the second claimer *waits*. Once the first commits, Postgres re-checks the `WHERE` on the locked rows, sees the new lease, and skips them, so the claims are still disjoint.
+   - Correctness comes from the lease; `SKIP LOCKED` is what stops replicas **queueing behind each other**.
+   - The new test holds one claim open and requires a second dispatcher to take the other rows within 2 s. The mutant now times out.
+4. *The second generated file had `rows_dead=200`.* `make_export` re-randomises `SHIPPER_CODE` per call, so re-exporting the same shipments "moved" two thirds of them to other shippers. The owner-change refusal (M3) dead-lettered them, exactly as designed. That's a test-data artifact, not a bug.
+{{BROKE}}
+
+**Known limits:**
+- **Secrets are stored in plaintext** (difference 39). They have to be: HMAC needs the key itself. Production wraps them with a KMS key.
+- **Rotation** is supported by the verifier (several `v1,` signatures), but there's no API to add a second secret yet.
+- **A slow endpoint holds a dispatcher slot for up to 5 s.** The batch is concurrent (50), so one slow shipper doesn't stall the others within a batch. A per-subscription concurrency cap is future work.
+- **The subscription list isn't paginated,** and there's no `PATCH` (to change `event_types`, delete and recreate).
+
+**Cloud vs real customer environment:** at Meridian:
+- The dispatcher's egress goes through an allow-listing proxy (the section 3 diagram's "egress allow-list"). The SSRF guard is defence in depth, not the only control.
+- Shipper endpoints have public certificates, so `WEBHOOK_CA_BUNDLE` and `WEBHOOK_DEV_ALLOW_HOSTS` stay unset. A startup check should refuse either outside dev.
+- Several dispatcher replicas share the outbox. `SKIP LOCKED` plus the lease is what makes that safe and fast.
+- The 72 h max age is agreed with shippers in the integration guide, together with the reference `verify()` and "de-duplicate on `webhook-id`".
+
+**Check yourself:**
+1. The poller commits a batch of 1,000 rows, and the process is killed one millisecond later, before the dispatcher runs. What happens to the events for those rows? What if it was killed one millisecond *before* the commit?
+2. Why is the claim's `UPDATE` committed *before* the HTTP call, instead of holding `FOR UPDATE` until the response arrives? What does that cost us, and who pays it?
+3. A shipper's DNS name resolved to a public IP when they subscribed. Now it resolves to `10.0.0.5`. What does the dispatcher do, and what would happen if we only checked at creation?
+
+<details><summary>answers</summary>
+
+1. After the commit, the delivery rows are durable in the same transaction as the shipments, so the dispatcher sends them when it next runs: nothing is lost. Before the commit, the shipments *and* their events roll back together. The poller re-reads the file from the last checkpoint and produces both again, exactly once. There's never an event for a change that didn't happen, or a change without its event.
+2. Holding the lock would keep a transaction and a pooled connection open for up to 5 s per delivery, and a crash mid-request would leave the row locked until the connection died. Committing a 60 s lease releases everything immediately. The cost is at-least-once delivery: if the dispatcher dies after the shipper received the request but before `record()` commits, the row is sent again after the lease. The *receiver* pays, by de-duplicating on `webhook-id` (which is why it's the stable `delivery_id`, even on replay).
+3. `ssrf.guard()` runs before every attempt. It resolves the name, finds a private address, and records the attempt as `failed` with `ssrf: …`, without sending a byte. It then retries with backoff until the max age, and the delivery dead-letters. With a creation-time check only, the gateway would POST signed shipment data into Meridian's own network. That's the classic DNS-rebinding SSRF, and the attacker controls the DNS.
+</details>
+
+**What would break in production here (spec section 12):**
+- **A shipper endpoint down for days:** its deliveries back off to one attempt per ≤6 h and dead-letter at 72 h. The outbox grows by their event rate; the partial index on due rows keeps the claim cheap. Alert on dead letters per subscription, not per delivery.
+- **A shipper that answers `200` without verifying:** we can't tell, and that's their risk. The integration guide and the reference `verify()` are the mitigation. A shipper that answers `410` by mistake disables its own subscription; it needs re-subscribing, and nothing is re-sent.
+- **The outbox table never shrinks:** delivered rows stay forever. Retention (delete delivered rows after N days) is M9 ops work, like the idempotency keys.

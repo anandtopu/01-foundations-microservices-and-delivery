@@ -1,7 +1,8 @@
 """The gateway API: `uvicorn gateway.app:app` (or `make api-local`).
 
 M5 wires the rate-quote route to the resilience stack; M6 adds the Postgres pool, API-key auth
-and idempotency. Later milestones add shipments (FR-3), webhooks (M7), /healthz and /readyz (M8).
+and idempotency; M7 adds webhook subscriptions and the ops dead-letter API. Later: shipments
+(FR-3), /healthz and /readyz (M8).
 """
 
 from collections.abc import AsyncIterator
@@ -11,7 +12,7 @@ import httpx
 from fastapi import FastAPI
 
 from gateway import errors
-from gateway.api import rate_quotes
+from gateway.api import dead_letters, rate_quotes, webhooks
 from gateway.config import Settings, get_settings
 from gateway.db import make_pool
 from gateway.resilience import Bulkhead, CircuitBreaker
@@ -46,8 +47,11 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
         redoc_url=None,
         openapi_url=None,
     )
+    app.state.cfg = cfg
     errors.install(app)
     app.include_router(rate_quotes.router)
+    app.include_router(webhooks.router)
+    app.include_router(dead_letters.router)
     return app
 
 
