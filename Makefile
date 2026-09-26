@@ -40,7 +40,8 @@ contract-lint:  ## (M1) Lint the OpenAPI 3.1 contract
 keys:  ## (M2) Generate the gateway SFTP key into secrets/ (skips if present)
 	@mkdir -p secrets && chmod 700 secrets
 	@test -f secrets/gateway_ed25519 || ssh-keygen -t ed25519 -N "" -C gateway@meridian-lab -f secrets/gateway_ed25519
-	@chown 10001:10001 secrets/gateway_ed25519 2>/dev/null || true  # (M8) the poller runs as uid 10001
+	@chown 10001:10001 secrets/gateway_ed25519 2>/dev/null \
+	  || echo "WARNING: could not chown secrets/gateway_ed25519 to uid 10001 (not root?). The containerised poller cannot read it: run 'sudo chown 10001 secrets/gateway_ed25519'."
 	cp secrets/gateway_ed25519.pub mocks/sftp/gateway_ed25519.pub
 
 # Docker Hub allows 100 anonymous pulls/h per egress IP, and the cloud VM shares its IP, so we hit 429.
@@ -120,7 +121,7 @@ image: base-images  ## (M8) Build meridian-gateway (one image: API, poller, disp
 	docker image ls meridian-gateway
 
 migrate:  ## (M8) Apply additive migrations
-	$(COMPOSE) run --rm gateway-api python -m gateway.migrate
+	$(COMPOSE) run --rm gateway-migrate
 
 up:  ## (M8) Start the API and both workers (after make image and make migrate)
 	$(COMPOSE) up -d --no-build gateway-api sftp-poller webhook-dispatcher
@@ -131,7 +132,9 @@ down:  ## Stop this project's containers (keeps volumes)
 logs:  ## Follow logs (S=<service>)
 	$(COMPOSE) logs -f --tail=100 $(S)
 
-schemathesis:  ## (M8) Conformance tests against the running API
+schemathesis:  ## (M8) Conformance tests against the running API (clears the previous run's fuzz subscriptions first)
+	@$(COMPOSE) exec -T postgres psql -qAt -U gateway -d gateway \
+	  -c "DELETE FROM webhook_subscriptions WHERE url LIKE 'https://webhook-sink:9000/webhooks/fuzz%'" >/dev/null
 	uvx schemathesis==4.28.0 run contracts/openapi.yaml --url http://localhost:8000 -H "X-API-Key: dev-shipper-key" --checks all
 
 audit:  ## Known-vulnerability scan of the locked dependencies

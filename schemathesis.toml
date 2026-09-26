@@ -7,6 +7,9 @@
 # exactly those operations and exactly those statuses, the rejection is declared expected. Every other
 # check, and every other status, stays as strict as the default. (ARCHITECTURE difference 53.)
 
+# Generated webhook URLs always point at the lab sink: see tests/contract/schemathesis_hooks.py.
+hooks = "tests.contract.schemathesis_hooks"
+
 # Default expected statuses for this check, plus the one documented semantic rejection per operation.
 
 [[operations]]

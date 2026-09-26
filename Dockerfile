@@ -10,6 +10,9 @@
 #   Debian-slim image cannot pass. python:3.14-alpine is 52 MB, and every binary dependency in
 #   uv.lock ships a musllinux wheel for CPython 3.14 (checked: psycopg-binary, cryptography,
 #   grpcio, uvloop, pydantic-core, ...). Same interpreter release as the host (3.14.7).
+# - No bytecode is shipped (+15 MB): each container start compiles imports in memory, ~3 s slower
+#   than with cached .pyc (4.2 s vs 0.9 s to import the three entry points; ARCHITECTURE diff. 59).
+#   Stripped .so files no longer match their wheels' RECORD hashes; harmless at runtime.
 # - The wheels' shared objects carry symbols: `strip --strip-unneeded` takes the venv from 98 MB to
 #   ~78 MB (uvloop alone 15.7 MB -> 2.3 MB). Deleting files in a later layer would not shrink the
 #   image, so the venv is stripped in a throwaway stage and copied once. The strip stage is Debian
@@ -21,14 +24,20 @@ ENV UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy UV_COMPILE_BYTECODE=0 \
     UV_PROJECT_ENVIRONMENT=/app/.venv PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /src
 COPY pyproject.toml uv.lock ./
-COPY src ./src
 # build_ca: OPTIONAL BuildKit secret, the CA of a TLS-inspecting egress proxy (the cloud VM). Mounted
-# for this RUN only, never stored in a layer; empty elsewhere (see mocks/Dockerfile.python).
+# for these RUNs only, never stored in a layer; empty elsewhere (see mocks/Dockerfile.python).
+# --locked, not --frozen: --frozen trusts uv.lock blindly, --locked FAILS if it no longer matches
+# pyproject.toml (PR #6 review). Dependencies first, in their own layer, so a source edit does not
+# re-download the whole tree.
 RUN --mount=type=secret,id=build_ca \
     if [ -s /run/secrets/build_ca ]; then \
       export PIP_CERT=/run/secrets/build_ca SSL_CERT_FILE=/run/secrets/build_ca; fi; \
     pip install --no-cache-dir uv==0.12.19 && \
-    uv sync --frozen --no-dev --no-editable --no-cache
+    uv sync --locked --no-dev --no-install-project --no-cache
+COPY src ./src
+RUN --mount=type=secret,id=build_ca \
+    if [ -s /run/secrets/build_ca ]; then export SSL_CERT_FILE=/run/secrets/build_ca; fi; \
+    uv sync --locked --no-dev --no-editable --no-cache
 
 # --- 2. strip symbols and bytecode caches in a throwaway stage -----------------------------------
 FROM debian:trixie-slim AS strip

@@ -206,3 +206,105 @@ async def test_rfc3339_edge_values_are_accepted(client: httpx.AsyncClient, value
 async def test_not_rfc3339_is_422(client: httpx.AsyncClient, value: str) -> None:
     r = await client.get("/v1/shipments", params={"updated_since": value}, headers=ACME)
     assert r.status_code == 422
+
+
+async def test_a_late_committing_writer_never_lands_behind_a_readers_cursor(
+    client: httpx.AsyncClient,
+) -> None:
+    """PR #6 review, reproduced: with updated_at = now() (the transaction START), a writer that
+    started earlier but committed later made its row appear behind a reader's cursor, and the
+    feed skipped it forever. Writers now serialise and stamp clock_timestamp() after the lock."""
+    import uuid
+
+    from psycopg import AsyncConnection
+
+    from gateway.api.dead_letters import replay_row
+    from tests.integration.conftest import API_TEST_URL
+
+    line = '"{sid}","ORD-{sid}","ACME","D",1260924,  10.00'
+    async with (
+        await AsyncConnection.connect(API_TEST_URL) as early,
+        await AsyncConnection.connect(API_TEST_URL) as late,
+    ):
+        await early.execute("SELECT now()")  # `early` starts its transaction FIRST...
+        async with late.transaction():  # ...but `late` writes and commits first
+            assert (
+                await replay_row(late, uuid.uuid4(), {"raw": line.format(sid="LATE1")}) == "applied"
+            )
+        # A reader pages through everything committed so far; its cursor passes LATE1.
+        seen = await all_pages(client, "limit=200")
+        assert seen[-1] == "LATE1"
+        cursor_at = (await client.get("/v1/shipments/LATE1", headers=ACME)).json()["updated_at"]
+        applied = await replay_row(early, uuid.uuid4(), {"raw": line.format(sid="EARLY1")})
+        await early.commit()
+        assert applied == "applied"
+    # EARLY1 must appear AFTER the reader's position, so the next page (or updated_since) sees it.
+    newer = await all_pages(client, f"updated_since={cursor_at.replace('+00:00', 'Z')}")
+    assert "EARLY1" in newer
+
+
+async def test_readiness_opens_at_most_one_ssh_connection_per_interval(
+    api_pool: AsyncConnectionPool,
+) -> None:
+    """Each unauthenticated SSH connect earns an sshd penalty (OpenSSH 10 PerSourcePenalties):
+    40 probes in a row got the API's address dropped and readiness flipped to 503 (PR #6 review).
+    A fake SSH server counts the connects: 30 probes must cost exactly one."""
+    import asyncio
+
+    accepts = 0
+
+    async def handle(_: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        nonlocal accepts
+        accepts += 1
+        writer.write(b"SSH-2.0-fake\r\n")
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    async with server, app_client(api_pool, sftp_host="127.0.0.1", sftp_port=port) as c:
+        statuses = {(await c.get("/readyz")).status_code for _ in range(30)}
+    assert (statuses, accepts) == ({200}, 1)
+
+
+async def test_readiness_fails_when_the_database_is_down(api_pool: AsyncConnectionPool) -> None:
+    from psycopg_pool import AsyncConnectionPool as Pool
+
+    dead = Pool("postgresql://gateway:gateway@127.0.0.1:1/none", open=False, timeout=0.5)
+    await dead.open(wait=False)
+    try:
+        async with app_client(dead, sftp_host="localhost", sftp_port=2222) as c:
+            r = await c.get("/readyz")
+    finally:
+        await dead.close()
+    assert (r.status_code, r.json()["status"], r.json()["db"]) == (503, "not_ready", "error")
+
+
+async def test_unknown_query_checks_come_after_auth_and_skip_the_probes(
+    client: httpx.AsyncClient,
+) -> None:
+    """No pre-auth oracle for which parameters exist, and probes accept cache-busters."""
+    assert (await client.get("/v1/dead-letters?bogus=1")).status_code == 401
+    assert (await client.get("/v1/shipments?bogus=1")).status_code == 401
+    assert (await client.get("/healthz?cachebust=1")).status_code == 200
+    r = await client.post(
+        "/v1/webhook-subscriptions?dryRun=1",
+        json={"url": "https://93.184.216.34/h", "event_types": ["shipment.created"]},
+        headers=ACME,
+    )
+    assert (r.status_code, r.json()["errors"][0]["location"]) == (422, "/query/dryRun")
+    assert (await client.get("/v1/dead-letters?bogus=1", headers=OPS)).status_code == 422
+
+
+async def test_cursors_bind_to_the_filter_instant_both_ways(client: httpx.AsyncClient) -> None:
+    filtered = (
+        await client.get("/v1/shipments?limit=1&updated_since=2026-09-24T09:15:00Z", headers=ACME)
+    ).json()["next_cursor"]
+    unfiltered = await client.get(f"/v1/shipments?cursor={filtered}", headers=ACME)
+    assert unfiltered.status_code == 400  # a filtered cursor on an unfiltered query
+    same_instant = await client.get(
+        "/v1/shipments",
+        params={"updated_since": "2026-09-24T11:15:00+02:00", "cursor": filtered},
+        headers=ACME,
+    )
+    assert same_instant.status_code == 200  # one instant, two spellings: one filter
