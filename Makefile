@@ -117,7 +117,9 @@ load-quotes:  ## (M5) 50-VU k6 burst on POST /v1/rate-quotes (needs api-local); 
 
 image: base-images  ## (M8) Build meridian-gateway (one image: API, poller, dispatcher, migrations) and show its size
 	$(COMPOSE) build gateway-api
-	docker tag meridian-gateway:latest meridian-gateway:$$(git rev-parse --short HEAD)  # for rollback (spec section 6)
+	@# Tag what Compose actually built (its tag comes from GATEWAY_TAG, e.g. "dev" in .env) with the
+	@# commit, so `GATEWAY_TAG=<older sha> make up` can roll back (spec section 6).
+	docker tag "$$($(COMPOSE) config --images | grep '^meridian-gateway:' | head -1)" meridian-gateway:$$(git rev-parse --short HEAD)
 	docker image ls meridian-gateway
 
 migrate:  ## (M8) Apply additive migrations

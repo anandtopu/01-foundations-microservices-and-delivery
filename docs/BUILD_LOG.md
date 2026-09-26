@@ -1158,7 +1158,7 @@ The live gate was re-run on the lab stack with the reviewed code (`make api-loca
   - The default command runs the API. The same image runs `python -m gateway.ingest.poller`, `…webhooks.dispatcher` or `…migrate`.
   - Built in three stages (below). It runs as `USER 10001`.
   - The build context holds only `pyproject.toml`, `uv.lock`, `src/` and `migrations/`.
-- `compose.yaml`: `gateway-api`, `sftp-poller` and `webhook-dispatcher`, all from that image.
+- `compose.yaml`: `gateway-api`, `sftp-poller` and `webhook-dispatcher`, all from that image (plus, after the PR #6 review, a one-shot `gateway-migrate` they wait for).
   - Read-only root filesystem, `tmpfs /tmp`, `cap_drop: [ALL]`, `no-new-privileges`.
   - Each service gets only its own secrets: the poller holds the SFTP key and `known_hosts`, the dispatcher the lab CA (difference 57).
 - `Makefile`: `make image`; `make up` no longer builds implicitly; `make keys` chowns the SFTP key to uid 10001; the Alpine base is added to `make base-images`.
@@ -1207,7 +1207,7 @@ Seed: 106031191864466879380418237847163736378
 ```
 
 - **A second run with a different seed:** 2,729 generated, 2,729 passed, 0 failures (seed `44908709…`).
-- **Image size:** `docker image ls` gives **179 MB**. On this VM's containerd store that number is unpacked + compressed; the image is 130 MB unpacked and 42.2 MB compressed (difference 55). It runs as `uid=10001(gateway)`.
+- **Image size:** `docker image ls` gives **179 MB**. On this VM's containerd store that number is unpacked + compressed: 136.5 MB (130 MiB) unpacked + 42.2 MB compressed (difference 55). It runs as `uid=10001(gateway)`.
 - **The three warnings are expected, and none of them is a failure:**
   - the ops-only replay operation answers `403` to the spec's shipper key;
   - GET and DELETE of a subscription mostly see random UUIDs (`404`);
@@ -1220,7 +1220,7 @@ Seed: 106031191864466879380418237847163736378
 |---|---|---|---|
 | 1 | `OPTIONS /v1/webhook-subscriptions/{id}` → 405 with `Allow: GET`, which leaves out `DELETE` (`allow_header_conformance`) | Starlette builds `Allow` from the *first* route that matched the path, but GET and DELETE are two routes | The 405 handler asks the router, method by method, which methods fully match. Regression test `test_405_lists_every_method_of_the_path` |
 | 1 | `origin_zip: "00000"` → **502** (`not_a_server_error`) | The mock's "ZIP not served" refusal was mapped to 502: a 5xx for the shipper's own input | `422 upstream-rejected`; 502 is kept for unusable upstream data. Contract updated (difference 52) |
-| 1 | `cursor=0` → 400; `url=https://0.com` → 422; a reused `Idempotency-Key` → 422 (`positive_data_acceptance`) | Documented rejections that a JSON Schema cannot express (server state, DNS, Meridian) | `schemathesis.toml`: for those 4 operations only, that status only (difference 53) |
+| 1 | `cursor=0` → 400; `url=https://0.com` → 422; a reused `Idempotency-Key` → 422 (`positive_data_acceptance`) | Documented rejections that a JSON Schema cannot express (server state, DNS, Meridian) | `schemathesis.toml`: for those 4 operations only, that status only (difference 53; a fifth, the replay, was added after the ops-key run) |
 | 2 | `updated_since=0.5` → 200 (`negative_data_rejection`) | Pydantic's lax datetime parsing reads a number-like string as a Unix timestamp | An RFC 3339 regex before parsing. Tests for `0.5`, `1727170500`, a bare date and no offset; the mutant fails 2 |
 | 3 | `?x-schemathesis-unknown-property=42` → 200 (`negative_data_rejection`) | Unknown query parameters were ignored, so a typo'd filter returned everything | An app-level dependency: an undeclared query parameter is `422` on every route (difference 58). Test `test_unknown_query_parameters_are_422` |
 | 4 | none | | 0 failures in two runs |
@@ -1232,7 +1232,7 @@ $ uvx schemathesis==4.28.0 run contracts/openapi.yaml --url http://localhost:800
 ```
 
 - **First run: 1 failure.** Through the list operation's link, Schemathesis found real dead letters, replayed them, and got `422 replay-rejected` ("owner change refused: 'BOLT' -> 'CRUX'"). That is the owner check working, and the contract documents it on this operation. It is the same class as round 1, so it was added to `schemathesis.toml`.
-- **What that run changed:** it replayed real lab dead letters. I checked `dead_letter_replays`: 208 `rejected: owner change refused` and 13 `already_resolved`, with **no** `applied` or `queued`. So no data changed, and every attempt was audited. A fuzzer holding an ops key belongs on an expendable database (this lab), never production.
+- **What that run changed:** it replayed real lab dead letters. `dead_letter_replays` gained 208 `rejected: owner change refused` and 13 `already_resolved` in the first run, and another 163 + 16 in the re-run, with **no** `applied` or `queued`. So no shipment changed, but it was not a read-only run: about 400 audit rows were added and `replay_count` / `last_replayed_at` moved on 371 dead letters (counts from the PR #6 review). A fuzzer holding an ops key belongs on an expendable database (this lab), never production.
 - **Re-run: 1,852 generated, 1,852 passed, 0 failures.**
 
 **What broke and how we fixed it:**
@@ -1241,7 +1241,7 @@ $ uvx schemathesis==4.28.0 run contracts/openapi.yaml --url http://localhost:800
    - *Hypothesis:* the listed size is not the unpacked size.
    - *Evidence:* `docker image inspect` gave 43.5 MB (compressed), and `du -sx /` inside a container gave 125 MB.
    - *Root cause:* on this VM's containerd image store, `DISK USAGE` = unpacked + compressed. The locked runtime dependencies add 98 MB (grpcio 18, psycopg-binary 19, cryptography 16, uvloop 16 …). A Debian-slim image would list at roughly 290 MB.
-   - *Fix:* an Alpine base (every binary dependency has a musllinux cp314 wheel, checked in `uv.lock` first) plus stripped shared objects. Final: 179 MB listed, 130 MB unpacked.
+   - *Fix:* an Alpine base (every binary dependency has a musllinux cp314 wheel, checked in `uv.lock` first) plus stripped shared objects. Final: 179 MB listed, 136.5 MB (130 MiB) unpacked.
    - *Lesson:* measure what the gate's command measures, and measure before you build.
 2. *`apk add binutils` failed:* "no such package". `curl` showed the proxy answering **403** for `dl-cdn.alpinelinux.org`: it isn't on the lab allowlist. GNU `strip` works on any ELF file, so the strip stage is Debian (`deb.debian.org` works).
    - If the user adds `dl-cdn.alpinelinux.org` under Environment settings → Network access → Custom, the strip stage could be Alpine too. Nothing depends on it.
@@ -1266,12 +1266,99 @@ $ uvx schemathesis==4.28.0 run contracts/openapi.yaml --url http://localhost:800
 
 <details><summary>answers</summary>
 
-1. Page 2 continues strictly after the last `(updated_at, shipment_id)` on page 1: rows 51–100 in order, followed eventually by row 10 (now at the end, with its new status) and the new shipment. Nothing is skipped and the client sees row 10's change. With `OFFSET 50`, row 10 moving to the end shifts every later row up by one, so the row that was 51st is now 50th and is **skipped** on page 2.
+1. Page 2 continues strictly after the last `(updated_at, shipment_id)` on page 1: rows 51–100 in order, followed eventually by row 10 (now at the end, with its new status) and the new shipment. Nothing is skipped and the client sees row 10's change. That "nothing is skipped" holds only because shipment writers are serialised and stamp `updated_at` after taking their lock: as first built, with `now()` and two writers, a late-committing transaction could land behind the reader (difference 60, found by the PR #6 review). With `OFFSET 50`, row 10 moving to the end shifts every later row up by one, so the row that was 51st is now 50th and is **skipped** on page 2.
 2. Liveness answers "is this process wedged?". Only a restart fixes that. If it checked the database, a 20-second failover would fail all 6 replicas' liveness together, and the orchestrator would kill and restart all of them at once: a restart storm, with cold pools, on top of the outage. Readiness answers "should I get traffic?". All 6 go not-ready, the load balancer stops sending them requests (shippers get fast errors from the balancer), and they come back by themselves as soon as the database does.
 3. A JSON Schema can say "a string of 1–512 characters", but not "a cursor this server issued for this filter". That depends on server state. The contract already documents the `400`. Changing the schema couldn't make a made-up cursor valid, so the rejection is correct behaviour. Declaring it per operation and per status keeps the check strict everywhere else: a real mismatch, such as the API rejecting a valid `limit=200`, would still fail the gate.
 </details>
 
 **What would break in production here (spec section 12):**
-- **The image drifts from the lock.** Anyone building with `uv sync` without `--frozen` could pull different versions than tested. The build uses `--frozen`, and CI should fail on lock drift (`uv lock --check`).
+- **The image drifts from the lock.** `--frozen` trusts `uv.lock` blindly; since the PR #6 review the build uses `--locked`, which fails when the lock no longer matches `pyproject.toml`. CI should also run `uv lock --check`.
 - **musl surprises.** Alpine's musl libc is not glibc: its DNS resolver behaves differently (for example it queries all nameservers in parallel), and its malloc can be slower under many threads. The load test (M5's k6) should be repeated against the container before production. If p99 regresses, the fallback is a distroless or Debian image and a size-budget exception, not a silent switch.
-- **A readiness check that is too eager.** `/readyz` makes a TCP connect to SFTP on every probe. At a 5-second probe interval across many replicas, that's constant connections to Meridian's DMZ host. Cache the result for a few seconds, or probe less often, before scaling out.
+- **A readiness check that is too eager.** As first built, `/readyz` made a TCP connect to SFTP on every probe, and the PR #6 review proved the risk real: OpenSSH 10's per-source penalties dropped the API's address after ~16 probes. It is now cached for 15 s per process (difference 61). Across many replicas that is still N connections per 15 s to Meridian's DMZ host; a poller heartbeat in the database is the better signal at scale.
+- **Readiness under load.** `db_ok` waits 1 s for a pool connection: a fleet whose pools are saturated by traffic can go not-ready together, shedding exactly when busy. A dedicated probe connection, or treating a pool timeout as busy rather than down, is the fix before production.
+
+---
+
+## PR #6 review — three independent review agents   (2026-09-26, session 3)
+
+**What happened:** three review agents read the M8 diff in parallel:
+1. API correctness, security and contract, against its own scratch database and the live API;
+2. the image, Compose, supply chain and ops security, inspecting the image and a throwaway build;
+3. spec fidelity, gate honesty and docs. This one was the only reviewer running `make check`.
+
+The gate reviewer re-ran the spec's gate and got the same result (179 MB, `USER 10001`, Schemathesis 2,801 of 2,801 passed, `make check` 379). It also ran it **without** `schemathesis.toml` to show what the file suppresses: exactly the 3 documented rejections, and nothing else.
+
+The image reviewer confirmed:
+- no secrets, `.env`, build CA or dev tools in the image (checked by listing layers and by the SHA-256 fingerprints of all 152 proxy-bundle certificates);
+- every stripped wheel still works (39 packages and 13 extension modules imported, each exercised);
+- musl DNS behaves;
+- the hardening is applied to every service.
+
+**The headline: the gate itself did harm.** On its first run, Schemathesis created 24 ACME subscriptions to **real internet domains** (ul2.net, 1e100.dev, …). The SSRF guard correctly allowed them, since they are public. The containerised dispatcher then spent 30 minutes trying to POST signed `rate_quote.completed` events to strangers: 2,756 queued deliveries, retrying for 72 h. None arrived (every attempt timed out). I deleted the 24 rows and their deliveries as soon as the reviewer reported it.
+
+The same 24 rows plus the M7 subscription made exactly 25, the new per-shipper cap. So rounds 2–5 of the gate never exercised a *successful* subscription create; each attempt got `422 subscription-limit-reached`, which was declared expected.
+- **Fix:** a Schemathesis hook forces every generated webhook URL to the lab sink, and `make schemathesis` clears the previous run's fuzz subscriptions first.
+- **Lesson:** a fuzzer is a real client. Point it only at things it may touch, and read what the gate's own warnings imply.
+
+**Findings and outcomes:**
+
+| # | Finding | Severity | Reproduced? | Fix | Regression test |
+|---|---|---|---|---|---|
+| 1 | **The 502→422 change was too broad.** Every `UpstreamRejected` became "change your request", including an HTML 404 page from a broken endpoint, an oversize body, a missing result and unknown fault codes. That blamed shippers for our outages and hid them from 5xx alerting | must-fix | yes (by reading the classifier) | Only a SOAP `Client` fault is 422; all other unusable answers are `UpstreamInvalidResponse`, 502 (difference 52) | `html404_broken_endpoint`, `version_mismatch`, `client_fault` cases; the API's `broken_upstream` case |
+| 2 | **Anyone could make `/readyz` return 503.** Each probe was an unauthenticated SSH connect; OpenSSH 10's `PerSourcePenalties` dropped the API's address after about 16 in a row | must-fix | yes: 40 calls gave 16 × 200, then 24 × 503 | The SFTP probe result is cached for 15 s and shared by concurrent calls (difference 61) | `test_readiness_opens_at_most_one_ssh_connection_per_interval` (30 probes, 1 connect) |
+| 3 | **A crafted cursor gave a 500:** a NUL byte in its ID (`DataError`) or a lone surrogate (`UnicodeEncodeError`). The PR #5 lesson, only half applied | must-fix | yes (live) | The cursor's ID must match the contract's `ShipmentId` pattern and length | `nul_id`, `surrogate_id`, `long_id` cases |
+| 4 | **Rows could be skipped forever.** `updated_at = now()` is the transaction *start*. With two writers (the poller and a dead-letter replay), a transaction that started earlier but committed later put rows behind a reader's cursor | should-fix (both API reviewers) | yes (two connections, commit held for 4 s) | Writers serialise on a transaction advisory lock and stamp `clock_timestamp()` after taking it (difference 60) | `test_a_late_committing_writer_never_lands_behind_a_readers_cursor` (catches `now()`), `test_concurrent_writers_are_serialised` (catches a missing lock) |
+| 5 | **The rollback didn't work.** The images were hard-coded to `:latest`, so the spec's `GATEWAY_TAG=<sha> docker compose up` silently redeployed the current build | must-fix (image reviewer) | yes (`config --images`) | `image: meridian-gateway:${GATEWAY_TAG:-latest}`; `make image` tags what Compose built with the commit SHA (difference 62) | `GATEWAY_TAG=deadbee docker compose config --images` → 3 × `:deadbee` |
+| 6 | **Fuzzing contacted real internet domains** (above) | should-fix | yes (database + logs) | The rows were deleted; the hook plus pre-run cleanup | the re-gate below: 0 external subscriptions |
+| 7 | **Unknown-query 422 came before auth**, which revealed which parameters exist, and it applied to the probes (a `?x=1` cache-buster made `/healthz` fail) | should-fix | yes | The check runs inside the auth dependency after the key is verified; the key-less probes never run it (difference 58) | `test_unknown_query_checks_come_after_auth_and_skip_the_probes` |
+| 8 | Container-to-sink webhook delivery had never run: the only subscription was `https://localhost:9000`, which inside a container means the container itself | should-fix | yes (by reading the config) | A subscription to `https://webhook-sink:9000/webhooks/acme`; the M7 `localhost` one disabled with a reason | live: 30 rows ingested by the container poller → 4 deliveries → **4 of 4 `signature=valid`** |
+| 9 | The workers waited for the API to be "healthy", which proved nothing about migrations and coupled them to the API | should-fix | yes | A one-shot `gateway-migrate` service; everything waits for `service_completed_successfully` | live: `gateway-migrate Exited (0)`, then the three start |
+| 10 | The API was published on 0.0.0.0 while the lab's dev keys are weak; env vars were shared across services | should-fix | yes | `127.0.0.1:8000`; each service gets only the variables it reads | `docker compose config` / `docker port` |
+| 11 | `uv sync --frozen` does not detect lock drift; the dependency layer was rebuilt on every source edit | should-fix / nit | yes | `--locked`; a dependency-only `uv sync --no-install-project` layer before `COPY src` | the rebuild |
+| 12 | Leap second (`…:60Z`) and year `0000`, both valid RFC 3339, gave 422; a space separator was accepted; a cursor was bound to the filter's spelling, not its instant | should-fix / nit | yes (live) | Leap second → `:59.999999`, year 0000 → earliest instant; `T` only with `fullmatch`; binding in UTC | `test_rfc3339_edge_values_are_accepted`, `test_not_rfc3339_is_422`, `test_cursors_bind_to_the_filter_instant_both_ways` |
+| 13 | Missing tests: readiness with the database down, unknown-query on POST and ops routes, reverse cursor binding | should-fix | n/a | added | `test_readiness_fails_when_the_database_is_down`, … |
+| 14 | `.schemathesis/` cache committed; `make keys` chown failed silently for non-root users; the startup cost of shipping no bytecode was undocumented; numbers mixed MB and MiB; ops-run side effects understated; round table said 4 operations | nit / should-fix | yes | untracked + `.gitignore`; a warning; difference 59; the M8 section corrected | n/a |
+
+**Not changed (with reason):**
+- **The `schemathesis.toml` exceptions stay per status, not per problem `type`.** A custom check is the stricter follow-up; the residual risk is recorded in difference 53.
+- **HEAD on GET routes is 405.** FastAPI's `APIRoute` doesn't add HEAD, and the contract doesn't promise it.
+- **Readiness can go 503 under pool saturation.** It is recorded in "What would break in production" with the fix.
+- **Base images aren't pinned by digest, and the uv install isn't hash-checked.** That belongs with M9/M10 supply-chain work (scan, sign, SBOM).
+
+**Mutation check of the fixes:** 10 of 10 caught.
+- The mutations: no writer lock; `now()` instead of `clock_timestamp()`; no probe cache; no unknown-query check on a fresh key; binding by spelling; an unchecked cursor ID; a space separator allowed; no leap-second mapping; every fault treated as Client; unparseable responses treated as rejected.
+- Separately, reverting the upstream split fails the SOAP classification tests.
+
+**What broke while fixing:**
+1. **I reverted my own uncommitted work.**
+   - What I did: to restore the `.schemathesis` manifest that a reviewer's gate run had modified, I ran `git checkout -- .` without a path. That reverted every uncommitted change: the upstream split, the auth-order move, the UTC binding, the RFC 3339 regex, `GATEWAY_TAG` and `.gitignore`.
+   - How I found it: two later edits failed their "pattern must exist" assertions. I checked `git status` instead of retrying.
+   - Recovery: I re-applied the lost edits from the scripts in this session and committed at once. Nothing committed or pushed was affected.
+   - Lesson: always give `git checkout --` a path, and commit before any bulk git operation.
+2. **`make image` tagged the wrong image.** It assumed Compose builds `:latest`, but `.env` sets `GATEWAY_TAG=dev` (spec section 6), so the SHA tag landed on the *previous* build. It now asks Compose which image it built. I removed my stale tags; `docker image ls meridian-gateway` again shows one image.
+
+**Verification after the fixes:**
+The image was rebuilt (`make image`, which is now tagged `dev` and `87693b1`: one image, `5d9fbe53`), then `make up`: `gateway-migrate` exited 0 and the three processes started. The API is on `127.0.0.1:8000`.
+
+```text
+$ docker image ls meridian-gateway
+IMAGE                      ID             DISK USAGE   CONTENT SIZE
+meridian-gateway:87693b1   5d9fbe53c867        179MB         42.2MB
+meridian-gateway:dev       5d9fbe53c867        179MB         42.2MB
+$ docker image inspect meridian-gateway:dev --format 'User={{.Config.User}}'
+User=10001
+$ make schemathesis     # run 1 (seed 29162353...)
+  3004 generated, 3004 passed, 1196 skipped         (Coverage, Fuzzing, Stateful: all passed)
+$ make schemathesis     # run 2 (seed 20993427...)
+  2773 generated, 2773 passed, 1124 skipped
+$ psql: fuzz subscriptions -> 23 (all https://webhook-sink:9000/webhooks/fuzz), external -> 0
+```
+
+- **Container webhook path, end to end:** 30 rows were dropped, the containerised poller ingested them (`rows_ok=30`), and the containerised dispatcher delivered 4 ACME events to `https://webhook-sink:9000` over TLS through the lab CA. The sink logged **4 of 4 `signature=valid`**.
+- **`make check`:** ruff and mypy clean, **398 passed**. `make contract-lint` passes.
+
+**Lessons:**
+- **A conformance fuzzer is a real, tireless client.** It will use every capability the API grants, including "register any public URL" or "replay dead letters". Constrain what it generates, run it on an expendable stack, and check the side effects afterwards.
+- **A status-code mapping is a statement about *whose fault* something is.** "Change your request" (4xx) and "we are broken" (5xx) drive different behaviour in the client and in our alerting. Map from the cause, not from the exception class name.
+- **A health probe is also an attack surface,** and it talks to your dependencies on everyone's behalf. Make it cheap and cached, and don't let it reveal anything.
+- **Timestamps as cursors need a commit order.** With several writers, `now()` gives start order, and readers see commit order; serialising the writers, or stamping after the lock, is what makes the two agree.

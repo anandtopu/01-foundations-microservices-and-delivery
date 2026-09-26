@@ -308,3 +308,35 @@ async def test_cursors_bind_to_the_filter_instant_both_ways(client: httpx.AsyncC
         headers=ACME,
     )
     assert same_instant.status_code == 200  # one instant, two spellings: one filter
+
+
+async def test_concurrent_writers_are_serialised(client: httpx.AsyncClient) -> None:
+    """The lock half of the fix: without it, A stamps A1, B stamps a LATER B1 and commits, a
+    reader passes B1, then A commits A1 behind the reader: skipped forever."""
+    import asyncio
+    import uuid
+
+    from psycopg import AsyncConnection
+
+    from gateway.api.dead_letters import replay_row
+    from tests.integration.conftest import API_TEST_URL
+
+    line = '"{sid}","ORD-{sid}","ACME","D",1260924,  10.00'
+    async with (
+        await AsyncConnection.connect(API_TEST_URL) as a,
+        await AsyncConnection.connect(API_TEST_URL) as b,
+    ):
+
+        async def writer_b() -> str:
+            async with b.transaction():
+                return await replay_row(b, uuid.uuid4(), {"raw": line.format(sid="CONCB")})
+
+        async with a.transaction():
+            await replay_row(a, uuid.uuid4(), {"raw": line.format(sid="CONCA")})
+            task = asyncio.create_task(writer_b())
+            await asyncio.sleep(0.3)  # B would commit here if nothing serialised the writers
+            mid = (await client.get("/v1/shipments?limit=200", headers=ACME)).json()["data"]
+            reader_at = max(r["updated_at"] for r in mid)
+        assert await asyncio.wait_for(task, 5) == "applied"
+    later = await all_pages(client, f"updated_since={reader_at.replace('+00:00', 'Z')}")
+    assert {"CONCA", "CONCB"} <= set(later)  # nothing landed behind the reader
