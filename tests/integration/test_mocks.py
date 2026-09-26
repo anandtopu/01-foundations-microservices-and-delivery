@@ -7,7 +7,7 @@ import hmac
 import secrets
 import ssl
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
 import httpx
@@ -107,14 +107,18 @@ def sign(secret: str, msg_id: str, ts: int, body: bytes) -> str:
 
 
 @pytest.fixture
-def sink() -> httpx.Client:
+def sink() -> Iterator[httpx.Client]:
     if not reachable(SINK):
         pytest.skip("webhook-sink not running (make mocks)")
     client = httpx.Client(
         base_url=SINK, timeout=5, verify=ssl.create_default_context(cafile=LAB_CA)
     )
     client.post("/__reset")
-    return client
+    yield client
+    # Leave the shared lab sink answering 200: a 503 left behind by the outage test made the next
+    # live demo's deliveries fail for no visible reason (found re-running the M7 gate).
+    client.post("/__reset")
+    client.close()
 
 
 def deliver(

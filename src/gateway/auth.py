@@ -33,6 +33,7 @@ Scope = Literal["shipper", "ops"]
 class Principal:
     client_id: str
     scope: Scope
+    key_id: str = ""  # first 16 hex chars of sha256(key): names WHICH key acted, in audit trails
 
 
 def key_hash(key: str) -> bytes:
@@ -80,7 +81,7 @@ async def principal(
     if row is None:
         _cache.pop(digest, None)
         raise _unauthorized("This API key is not valid.")
-    who = Principal(client_id=row[0], scope=row[1])
+    who = Principal(client_id=row[0], scope=row[1], key_id=digest.hex()[:16])
     if len(_cache) >= CACHE_MAX:
         _cache.clear()  # crude but bounded; a real LRU is not worth it at this scale
     _cache[digest] = (now + CACHE_TTL_S, who)

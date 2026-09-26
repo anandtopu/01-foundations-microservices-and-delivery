@@ -136,9 +136,50 @@ async def test_dev_allowance_is_exact_and_still_https_only() -> None:
     await guard("https://localhost:9000/webhooks/acme", {"localhost"})  # the lab sink
     with pytest.raises(ValueError, match="non-public"):
         await guard("https://127.0.0.1:9000/", {"localhost"})  # not the same NAME
-    with pytest.raises(ValueError, match="non-public"):
+    with pytest.raises(ValueError, match="credentials"):  # userinfo is refused outright
         await guard("https://localhost.evil.test@127.0.0.1/", {"localhost"})
     with pytest.raises(ValueError, match="https"):
         await guard("http://localhost:9000/", {"localhost"})
     with pytest.raises(ValueError, match="non-public"):
         await guard("https://localhost/", ())  # no allowance configured: the default
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://[64:ff9b::a9fe:a9fe]/",  # NAT64 of 169.254.169.254
+        "https://[64:ff9b::a00:5]/",  # NAT64 of 10.0.0.5
+        "https://[64:ff9b:1::a00:5]/",  # local-use NAT64 prefix
+        "https://[::127.0.0.1]/",  # IPv4-compatible IPv6
+        "https://[::a00:5]/",
+    ],
+)
+async def test_guard_refuses_embedded_private_ipv4(url: str) -> None:
+    with pytest.raises(ValueError, match="non-public"):
+        await guard(url)
+
+
+async def test_the_specs_check_alone_misses_nat64() -> None:
+    """Why guard() adds a check: Python's is_global says True for the well-known NAT64 prefix, so
+    the spec's verbatim check lets metadata-via-NAT64 through (PR #5 review: the API said 201)."""
+    await assert_public_https("https://[64:ff9b::a9fe:a9fe]/")
+
+
+async def test_guard_allows_nat64_of_a_public_address() -> None:
+    await guard("https://[64:ff9b::5db8:d822]/hook")  # NAT64 of 93.184.216.34
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://93.184.216.34/hook\x01x",  # httpx refuses it: it crashed the dispatcher
+        "https://1.1.1.1\t/",  # urlsplit silently drops the tab
+        "https://93.184.216.34/a b",
+        "https://93.184.216.34/\n",
+        "https://user:pass@93.184.216.34/",  # would be sent as Basic auth
+    ],
+    ids=["ctrl", "tab", "space", "newline", "userinfo"],
+)
+async def test_guard_refuses_urls_the_client_would_read_differently(url: str) -> None:
+    with pytest.raises(ValueError):
+        await guard(url)

@@ -5,7 +5,9 @@ SSRF guard at creation (and again by the dispatcher before every attempt, since 
 change). The signing secret is generated here and returned exactly once.
 """
 
+import asyncio
 import base64
+import logging
 import secrets
 import uuid
 from typing import Annotated, Any, Literal
@@ -22,6 +24,9 @@ from gateway.webhooks import ssrf
 EventType = Literal["shipment.created", "shipment.status_changed", "rate_quote.completed"]
 Caller = Annotated[Principal, Depends(shipper_principal)]
 router = APIRouter()
+log = logging.getLogger("gateway.webhooks")
+MAX_SUBSCRIPTIONS = 25
+GUARD_TIMEOUT_S = 2.0
 
 
 class WebhookSubscriptionRequest(BaseModel):
@@ -59,14 +64,36 @@ async def create_subscription(
     body: WebhookSubscriptionRequest, request: Request, who: Caller
 ) -> JSONResponse:
     try:
-        await ssrf.guard(body.url, request.app.state.cfg.dev_allow_hosts)
-    except (ValueError, OSError) as exc:  # OSError: the name does not resolve at all
+        async with asyncio.timeout(GUARD_TIMEOUT_S):  # a shipper's slow DNS must not hold us
+            await ssrf.guard(body.url, request.app.state.cfg.dev_allow_hosts)
+    except (ValueError, OSError) as exc:  # OSError: does not resolve; TimeoutError: too slow
+        # The reason is logged, never returned: "resolves to 10.1.2.3" or "Name or service not
+        # known" would let a shipper map our internal DNS (PR #5 review).
+        log.info("webhook URL refused for %s: %s", who.client_id, exc)
         raise ProblemError(
-            422, "webhook-url-not-allowed", "Webhook URL not allowed", str(exc)
+            422,
+            "webhook-url-not-allowed",
+            "Webhook URL not allowed",
+            "The URL must be https, without credentials, and resolve only to public addresses.",
         ) from exc
     pool: AsyncConnectionPool = request.app.state.db
     sub_id, secret = uuid.uuid4(), new_secret()
-    async with pool.connection() as conn:
+    async with pool.connection() as conn, conn.transaction():
+        # Cap per shipper: every event fans out once per subscription, all on one shared
+        # dispatcher (PR #5 review). The advisory lock makes count-then-insert race-free.
+        await conn.execute("SELECT pg_advisory_xact_lock(hashtext('webhook-subs:' || %s))",
+                           (who.client_id,))  # fmt: skip
+        cur = await conn.execute(
+            "SELECT count(*) FROM webhook_subscriptions WHERE client_id = %s", (who.client_id,)
+        )
+        (count,) = await cur.fetchone() or (0,)
+        if count >= MAX_SUBSCRIPTIONS:
+            raise ProblemError(
+                422,
+                "subscription-limit-reached",
+                "Subscription limit reached",
+                f"At most {MAX_SUBSCRIPTIONS} subscriptions per shipper; delete one first.",
+            )
         cur = await conn.execute(
             """INSERT INTO webhook_subscriptions
                    (subscription_id, client_id, url, event_types, secret)
@@ -81,7 +108,10 @@ async def create_subscription(
     return JSONResponse(
         view(row) | {"secret": secret},
         status_code=201,
-        headers={"Location": f"/v1/webhook-subscriptions/{sub_id}"},
+        headers={
+            "Location": f"/v1/webhook-subscriptions/{sub_id}",
+            "Cache-Control": "no-store",  # the one response that carries the secret
+        },
     )
 
 

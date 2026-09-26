@@ -66,8 +66,9 @@ class IngestResult:
 # tells inserts from updates (old row absent) in the same statement. It replaced M3's
 # (xmax = 0) trick, which relied on an undocumented implementation detail.
 # Two rules the caller must keep: each shipment_id appears at most once per statement (Postgres
-# refuses to update a row twice in one INSERT ... ON CONFLICT), and client_id never changes, which
-# is why it is neither SET nor compared (commit_batch dead-letters owner changes first).
+# refuses to update a row twice in one INSERT ... ON CONFLICT), and client_id never changes: it is
+# never SET, and the WHERE refuses another owner's row even if the OWNERS check went stale (a new
+# shipment inserted by a concurrent writer, e.g. a dead-letter replay racing the poller: PR #5).
 UPSERT = """
 INSERT INTO shipments AS s
        (shipment_id, client_id, order_no, status, ship_date, weight_lb, source_file)
@@ -77,7 +78,8 @@ ON CONFLICT (shipment_id) DO UPDATE
    SET order_no = EXCLUDED.order_no, status = EXCLUDED.status,
        ship_date = EXCLUDED.ship_date, weight_lb = EXCLUDED.weight_lb,
        source_file = EXCLUDED.source_file, updated_at = now()
- WHERE (s.order_no, s.status, s.ship_date, s.weight_lb)
+ WHERE s.client_id = EXCLUDED.client_id
+   AND (s.order_no, s.status, s.ship_date, s.weight_lb)
        IS DISTINCT FROM
        (EXCLUDED.order_no, EXCLUDED.status, EXCLUDED.ship_date, EXCLUDED.weight_lb)
 RETURNING new.shipment_id, new.client_id, new.order_no, new.status, new.ship_date,
@@ -223,6 +225,19 @@ async def apply_rows(
         },
     )
     changed = await cur.fetchall()
+    # A row that came back neither inserted nor updated is either unchanged (fine) or, if a
+    # concurrent writer inserted it for ANOTHER shipper after our OWNERS check, refused by the
+    # UPSERT's WHERE: find those and dead-letter them like any owner change.
+    silent = [sid for sid in latest if sid not in {row[0] for row in changed}]
+    if silent:
+        cur = await conn.execute(
+            "SELECT shipment_id, client_id FROM shipments WHERE shipment_id = ANY(%s)", (silent,)
+        )
+        for shipment_id, owner in await cur.fetchall():
+            g = latest[shipment_id]
+            if owner != g.row.shipper_code:
+                reason = f"owner change refused: {owner!r} -> {g.row.shipper_code!r}"
+                refused.append(DeadRow(g.line_no, g.raw, reason))
     events = [e for row in changed if (e := shipment_event(row)) is not None]
     # The outbox insert rides in the same transaction as the upsert (spec M7).
     queued = await outbox.enqueue(conn, events)

@@ -252,3 +252,166 @@ async def test_a_second_dispatcher_does_not_wait_for_rows_being_claimed(
             async with asyncio.timeout(2):
                 taken = await claim(b, 50)
         assert len(taken) == 6
+
+
+# --- PR #5 review regressions ---------------------------------------------------------------------
+
+
+async def test_one_bad_receiver_cannot_take_the_batch_down(api_pool: AsyncConnectionPool) -> None:
+    """A URL httpx refuses (InvalidURL) and a receiver that makes httpx raise a non-transport
+    error (DecodingError) used to escape attempt(), abort gather(), leave the whole batch unrecorded
+    and kill the dispatcher; after the lease, the batch was re-sent and it crashed again."""
+    await seed(api_pool, url="https://hooks.test/bad\x01url")
+    await seed(api_pool, url="https://hooks.test/boom")
+    await seed(api_pool, url="https://hooks.test/ok")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/boom":
+            raise httpx.DecodingError("bad gzip")
+        return httpx.Response(204)
+
+    async with http(handler) as client:
+        assert await run_once(api_pool, client) == 3  # did not raise
+    async with api_pool.connection() as conn:
+        cur = await conn.execute(
+            """SELECT s.url, d.status, d.attempts, d.last_result
+                 FROM webhook_deliveries d JOIN webhook_subscriptions s USING (subscription_id)"""
+        )
+        rows = {url.rsplit("/", 1)[1]: rest for url, *rest in await cur.fetchall()}
+    assert rows["ok"] == ["delivered", 1, "HTTP 204"]
+    assert rows["boom"] == ["pending", 1, "DecodingError"]
+    status, attempts, result = rows["bad\x01url"]
+    assert (status, attempts) == ("pending", 1) and result.startswith("ssrf:")
+
+
+async def test_the_response_body_is_never_read(api_pool: AsyncConnectionPool) -> None:
+    """A gzip bomb (400 MB from 400 KB) was decompressed into memory before; now the outcome is the
+    status code alone, and we ask for no compression at all."""
+    await seed(api_pool)
+    chunks_read = 0
+
+    class Bomb(httpx.AsyncByteStream):
+        async def __aiter__(self):  # type: ignore[no-untyped-def]
+            nonlocal chunks_read
+            for _ in range(10_000):
+                chunks_read += 1
+                yield b"\0" * 65536
+
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, headers={"content-encoding": "gzip"}, stream=Bomb())
+
+    async with http(handler) as client:
+        await run_once(api_pool, client)
+    assert chunks_read == 0
+    assert seen[0].headers["accept-encoding"] == "identity"
+    assert await one(api_pool, "SELECT status FROM webhook_deliveries") == ("delivered",)
+
+
+async def test_a_stale_outcome_cannot_overwrite_a_newer_one(api_pool: AsyncConnectionPool) -> None:
+    """Dispatcher A's lease expires; B re-claims, delivers and records. A's late failure (past max
+    age) used to flip the row delivered -> dead and open a dead letter for a delivered event."""
+    from gateway.webhooks.dispatcher import Outcome, record
+
+    await seed(api_pool)
+    cfg = Settings(**(CFG.model_dump() | {"webhook_max_age": "120s"}))
+    async with await AsyncConnection.connect(API_TEST_URL) as conn:
+        await conn.execute("UPDATE webhook_deliveries SET window_start = now() - interval '3 min'")
+        await conn.commit()
+        (job_a,) = await claim(conn, 10)
+        await conn.execute("UPDATE webhook_deliveries SET next_attempt_at = now()")  # A's lease...
+        await conn.commit()  # ...expires while A is still waiting on a slow endpoint
+        (job_b,) = await claim(conn, 10)
+        assert await record(conn, job_b, Outcome("delivered", "HTTP 200"), cfg) == "delivered"
+        assert "stale" in await record(conn, job_a, Outcome("failed", "HTTP 503"), cfg)
+    assert await one(api_pool, "SELECT status FROM webhook_deliveries") == ("delivered",)
+    assert await one(api_pool, "SELECT count(*) FROM dead_letters") == (0,)
+
+
+async def test_a_410_in_a_batch_cancels_its_failing_siblings(api_pool: AsyncConnectionPool) -> None:
+    """Default batch size: the siblings are sent concurrently with the 410 (documented), but their
+    failures must not retry or dead-letter rows for a gone endpoint."""
+    sub = await seed(api_pool, n=4)
+    async with api_pool.connection() as conn:
+        await conn.execute("UPDATE webhook_deliveries SET window_start = now() - interval '3 min'")
+    cfg = Settings(**(CFG.model_dump() | {"webhook_max_age": "120s"}))
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(410 if calls == 1 else 503)
+
+    async with http(handler) as client:
+        await run_once(api_pool, client, cfg)
+    assert await one(
+        api_pool, "SELECT status FROM webhook_subscriptions WHERE subscription_id = %s", sub
+    ) == ("disabled",)
+    assert await one(api_pool, "SELECT array_agg(DISTINCT status) FROM webhook_deliveries") == (
+        ["cancelled"],
+    )
+    assert await one(api_pool, "SELECT count(*) FROM dead_letters") == (0,)
+
+
+async def test_a_row_queued_for_a_disabled_subscription_is_never_sent(
+    api_pool: AsyncConnectionPool,
+) -> None:
+    """The outbox INSERT can race a 410 (it saw the subscription active before the 410 committed):
+    such a row is cancelled at claim time, not sent to the endpoint that said it is gone."""
+    sub = await seed(api_pool)
+    async with api_pool.connection() as conn:
+        await conn.execute(
+            "UPDATE webhook_subscriptions SET status = 'disabled' WHERE subscription_id = %s",
+            (sub,),
+        )
+    sent: list[httpx.Request] = []
+    async with http(lambda r: sent.append(r) or httpx.Response(200)) as client:  # type: ignore[func-returns-value]
+        await run_once(api_pool, client)
+    assert sent == []
+    assert await one(api_pool, "SELECT status FROM webhook_deliveries") == ("cancelled",)
+
+
+async def test_deleting_the_subscription_mid_flight_does_not_crash(
+    api_pool: AsyncConnectionPool,
+) -> None:
+    """DELETE cascades the delivery away while it is in flight; recording a failure past max age
+    used to hit a foreign-key violation on the dead-letter INSERT and kill the dispatcher."""
+    from gateway.webhooks.dispatcher import Outcome, record
+
+    sub = await seed(api_pool)
+    cfg = Settings(**(CFG.model_dump() | {"webhook_max_age": "120s"}))
+    async with await AsyncConnection.connect(API_TEST_URL) as conn:
+        await conn.execute("UPDATE webhook_deliveries SET window_start = now() - interval '3 min'")
+        await conn.commit()
+        (job,) = await claim(conn, 10)
+        await conn.execute("DELETE FROM webhook_subscriptions WHERE subscription_id = %s", (sub,))
+        await conn.commit()
+        assert "stale" in await record(conn, job, Outcome("failed", "HTTP 503"), cfg)
+    assert await one(api_pool, "SELECT count(*) FROM dead_letters") == (0,)
+
+
+async def test_the_last_retry_lands_on_the_max_age_not_after_it(
+    api_pool: AsyncConnectionPool,
+) -> None:
+    """A 6 h backoff drawn at hour 71 used to push dead-lettering to ~hour 77."""
+    await seed(api_pool)
+    async with api_pool.connection() as conn:
+        await conn.execute("UPDATE webhook_deliveries SET window_start = now() - interval '110 s'")
+    cfg = Settings(**(CFG.model_dump() | {"webhook_max_age": "120s", "webhook_base_delay_s": 600}))
+    async with http(lambda _r: httpx.Response(503)) as client:
+        await run_once(api_pool, client, cfg)
+    status, late = await one(
+        api_pool,
+        """SELECT status, next_attempt_at > window_start + interval '120 s'
+             FROM webhook_deliveries""",
+    )
+    assert (status, late) == ("pending", False)
+
+
+def test_the_production_client_does_not_follow_redirects() -> None:
+    """The other tests build their own client, so they could not catch a change here."""
+    client = dispatcher.http_client(CFG)
+    assert client.follow_redirects is False
+    assert client.timeout.read == CFG.webhook_timeout_s

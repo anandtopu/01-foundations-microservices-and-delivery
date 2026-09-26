@@ -40,7 +40,11 @@ from gateway.webhooks.signing import sign
 log = logging.getLogger("gateway.webhooks")
 
 CLAIM_LEASE_S = 60  # must exceed one attempt (5 s); a crashed dispatcher's rows retry after this
+USER_AGENT = "meridian-gateway-webhooks/1"
 
+# The lease's expiry (d.next_attempt_at after the UPDATE) doubles as a fencing token: record() only
+# writes if the row still carries it, so a dispatcher whose lease expired (and whose row another
+# dispatcher re-claimed) cannot overwrite the newer outcome (PR #5 review).
 CLAIM = """
 WITH due AS (
     SELECT delivery_id FROM webhook_deliveries
@@ -54,7 +58,22 @@ UPDATE webhook_deliveries d
   FROM due, webhook_subscriptions s
  WHERE d.delivery_id = due.delivery_id AND s.subscription_id = d.subscription_id
 RETURNING d.delivery_id, d.event_type, d.payload, d.attempts, d.window_start,
-          s.subscription_id, s.url, s.secret, s.status
+          s.subscription_id, s.url, s.secret, s.status, d.next_attempt_at
+"""
+
+# A failed attempt, in ONE guarded statement. The max age is checked by the database clock
+# (now() - window_start), not the app's: no clock skew and no DST arithmetic on a zoned datetime
+# (PR #5 review). The next attempt is clamped to the end of the window, so "dead after 72 h" means
+# 72 h, not up to 78 h.
+FAILED = """
+UPDATE webhook_deliveries
+   SET attempts = attempts + 1, last_attempt_at = now(), last_result = %(detail)s,
+       status = CASE WHEN now() - window_start >= make_interval(secs => %(max_age)s)
+                     THEN 'dead' ELSE 'pending' END,
+       next_attempt_at = LEAST(now() + make_interval(secs => %(delay)s),
+                               window_start + make_interval(secs => %(max_age)s))
+ WHERE delivery_id = %(id)s AND status = 'pending' AND next_attempt_at = %(lease)s
+RETURNING status, attempts
 """
 
 
@@ -69,11 +88,12 @@ class Job:
     url: str
     secret: str
     subscription_status: str
+    lease: datetime  # fencing token: the claim's next_attempt_at
 
 
 @dataclass(frozen=True, slots=True)
 class Outcome:
-    kind: str  # delivered | gone | failed
+    kind: str  # delivered | gone | failed | cancelled
     detail: str  # "HTTP 204", "ConnectError", "ssrf: ..."
 
 
@@ -89,6 +109,19 @@ def body_bytes(payload: dict[str, Any]) -> bytes:
 
 
 async def attempt(client: httpx.AsyncClient, job: Job, cfg: Settings) -> Outcome:
+    """One delivery attempt. Never raises: whatever a receiver (or its URL) does, it becomes an
+    Outcome, so one bad endpoint cannot take the batch, or the dispatcher, down (PR #5 review)."""
+    try:
+        # ONE budget for the SSRF lookup and the request: a shipper's slow DNS counts too.
+        async with asyncio.timeout(cfg.webhook_timeout_s):
+            return await _send(client, job, cfg)
+    except TimeoutError:
+        return Outcome("failed", f"timeout after {cfg.webhook_timeout_s:g} s")
+    except Exception as exc:  # InvalidURL, DecodingError, TransportError, ...
+        return Outcome("failed", type(exc).__name__)
+
+
+async def _send(client: httpx.AsyncClient, job: Job, cfg: Settings) -> Outcome:
     try:
         await ssrf.guard(job.url, cfg.dev_allow_hosts)
     except (ValueError, OSError) as exc:
@@ -97,33 +130,33 @@ async def attempt(client: httpx.AsyncClient, job: Job, cfg: Settings) -> Outcome
     ts = int(time.time())
     headers = {
         "content-type": "application/json",
+        "user-agent": USER_AGENT,
+        "accept-encoding": "identity",  # we never read the body, so never ask for a compressed one
         "webhook-id": job.delivery_id,
         "webhook-timestamp": str(ts),
         "webhook-signature": sign(job.secret, job.delivery_id, ts, body),
     }
-    try:
-        async with asyncio.timeout(cfg.webhook_timeout_s):  # total, not per read
-            resp = await client.post(job.url, content=body, headers=headers)
-    except TimeoutError:
-        return Outcome("failed", f"timeout after {cfg.webhook_timeout_s:g} s")
-    except httpx.TransportError as exc:
-        return Outcome("failed", type(exc).__name__)
-    if 200 <= resp.status_code < 300:
-        return Outcome("delivered", f"HTTP {resp.status_code}")
-    if resp.status_code == 410:
+    # stream(): the outcome is the status code alone and the response body is never read, so a
+    # hostile receiver cannot answer with a gzip bomb or an endless body (PR #5 review).
+    async with client.stream("POST", job.url, content=body, headers=headers) as resp:
+        status = resp.status_code
+    if 200 <= status < 300:
+        return Outcome("delivered", f"HTTP {status}")
+    if status == 410:
         return Outcome("gone", "HTTP 410")
-    return Outcome("failed", f"HTTP {resp.status_code}")  # includes 3xx: redirects not followed
+    return Outcome("failed", f"HTTP {status}")  # includes 3xx: redirects are not followed
 
 
 async def record(conn: AsyncConnection, job: Job, outcome: Outcome, cfg: Settings) -> str:
     """Persist one attempt's outcome; returns a short log description."""
     async with conn.transaction():
         if outcome.kind == "delivered":
+            # The receiver has it, whatever happened to the row meanwhile: delivered wins.
             await conn.execute(
                 """UPDATE webhook_deliveries
                       SET status = 'delivered', delivered_at = now(), attempts = attempts + 1,
                           last_attempt_at = now(), last_result = %s
-                    WHERE delivery_id = %s""",
+                    WHERE delivery_id = %s AND status <> 'delivered'""",
                 (outcome.detail, job.delivery_id),
             )
             await conn.execute(  # a replayed dead letter is resolved once really delivered
@@ -146,15 +179,28 @@ async def record(conn: AsyncConnection, job: Job, outcome: Outcome, cfg: Setting
                 (outcome.detail, job.delivery_id, job.subscription_id),
             )
             return "subscription disabled (410)"
-        attempts = job.attempts + 1
-        age = (datetime.now(job.window_start.tzinfo) - job.window_start).total_seconds()
-        if age >= cfg.webhook_max_age_s:
-            await conn.execute(
-                """UPDATE webhook_deliveries
-                      SET status = 'dead', attempts = %s, last_attempt_at = now(), last_result = %s
-                    WHERE delivery_id = %s""",
-                (attempts, outcome.detail, job.delivery_id),
+        if outcome.kind == "cancelled":
+            cur = await conn.execute(
+                """UPDATE webhook_deliveries SET status = 'cancelled', last_result = %s
+                    WHERE delivery_id = %s AND status = 'pending' AND next_attempt_at = %s""",
+                (outcome.detail, job.delivery_id, job.lease),
             )
+            return "cancelled (" + outcome.detail + ")" if cur.rowcount else "stale, ignored"
+        cur = await conn.execute(
+            FAILED,
+            {
+                "detail": outcome.detail,
+                "max_age": cfg.webhook_max_age_s,
+                "delay": backoff_s(job.attempts, cfg),
+                "id": job.delivery_id,
+                "lease": job.lease,
+            },
+        )
+        row = await cur.fetchone()
+        if row is None:  # the lease was lost (re-claimed, cancelled, deleted): not ours to write
+            return f"stale outcome ignored ({outcome.detail})"
+        status, attempts = row
+        if status == "dead":
             source = {
                 "subscription_id": job.subscription_id,
                 "event_type": job.event_type,
@@ -169,30 +215,45 @@ async def record(conn: AsyncConnection, job: Job, outcome: Outcome, cfg: Setting
                 (reason, Jsonb(source), job.delivery_id),
             )
             return f"dead-lettered after {attempts} attempts ({outcome.detail})"
-        delay = backoff_s(job.attempts, cfg)
-        await conn.execute(
-            """UPDATE webhook_deliveries
-                  SET attempts = %s, last_attempt_at = now(), last_result = %s,
-                      next_attempt_at = now() + make_interval(secs => %s)
-                WHERE delivery_id = %s""",
-            (attempts, outcome.detail, delay, job.delivery_id),
+        cur = await conn.execute(
+            "SELECT extract(epoch FROM next_attempt_at - now()) FROM webhook_deliveries"
+            " WHERE delivery_id = %s",
+            (job.delivery_id,),
         )
-        return f"retry in {delay:.1f}s (attempt {attempts}, {outcome.detail})"
+        (delay,) = await cur.fetchone() or (0,)
+        return f"retry in {float(delay):.1f}s (attempt {attempts}, {outcome.detail})"
 
 
 async def claim(conn: AsyncConnection, n: int) -> list[Job]:
     async with conn.transaction():  # the lease commits before any HTTP call
         cur = await conn.execute(CLAIM, {"n": n, "lease": CLAIM_LEASE_S})
         rows = await cur.fetchall()
-    return [Job(str(r[0]), r[1], r[2], r[3], r[4], str(r[5]), r[6], r[7], r[8]) for r in rows]
+    return [Job(str(r[0]), r[1], r[2], r[3], r[4], str(r[5]), r[6], r[7], r[8], r[9]) for r in rows]
 
 
 async def dispatch_once(conn: AsyncConnection, client: httpx.AsyncClient, cfg: Settings) -> int:
-    """Claim a batch, attempt it concurrently, record each outcome. Returns how many were tried."""
+    """Claim a batch, attempt it concurrently, record each outcome; returns how many claimed."""
     jobs = await claim(conn, cfg.webhook_batch_size)
-    outcomes = await asyncio.gather(*(attempt(client, j, cfg) for j in jobs))
-    for job, outcome in zip(jobs, outcomes, strict=True):
-        what = await record(conn, job, outcome, cfg)
+
+    async def run_one(job: Job) -> Outcome:
+        if job.subscription_status != "active":
+            # Queued by a transaction that raced a 410 (PR #5 review): never send it.
+            return Outcome("cancelled", f"subscription {job.subscription_status}")
+        return await attempt(client, job, cfg)
+
+    outcomes = await asyncio.gather(*(run_one(j) for j in jobs))
+    # 410s first: they cancel the subscription's other pending rows, so a sibling's failure in the
+    # same batch then finds its row cancelled and is ignored, instead of retrying or dead-lettering
+    # a delivery for an endpoint that is gone (PR #5 review). Siblings already in flight were sent.
+    ordered = sorted(zip(jobs, outcomes, strict=True), key=lambda jo: jo[1].kind != "gone")
+    for job, outcome in ordered:
+        try:
+            what = await record(conn, job, outcome, cfg)
+        except psycopg.OperationalError:
+            raise  # the connection is gone: let run() reconnect; unrecorded leases just expire
+        except Exception:
+            log.exception("delivery=%s: recording %s failed", job.delivery_id, outcome.detail)
+            continue  # one row's problem must not lose the rest of the batch's outcomes
         log.info("delivery=%s event=%s -> %s", job.delivery_id, job.event_type, what)
     return len(jobs)
 
@@ -218,9 +279,10 @@ async def run(cfg: Settings, *, once: bool) -> None:
                 async with await AsyncConnection.connect(cfg.database_url) as conn:
                     while await dispatch_once(conn, client, cfg):
                         pass  # drain everything due before sleeping
-            except (OSError, psycopg.OperationalError) as err:
+            except Exception as err:
                 if once:
                     raise
+                # Keep going whatever happened: a dead dispatcher stops webhooks for every tenant.
                 log.error("dispatch failed: %s: %s", type(err).__name__, err)
             if once:
                 return

@@ -187,6 +187,12 @@ Run the webhook dispatcher on the host, in its own terminal (it drains the outbo
 make dispatch-local
 ```
 
+For the dead-letter demo, run it with a 2-minute max age instead of 72 h:
+
+```bash
+WEBHOOK_MAX_AGE=120s make dispatch-local
+```
+
 Subscribe ACME's webhook sink to shipment events. The response carries the signing secret **once**; keep it:
 
 ```bash
@@ -208,7 +214,7 @@ docker compose logs webhook-sink --since 15m | grep -c "signature=valid"
 List the dead letters and replay one as ops (a webhook replay answers `202 queued`; it is resolved when delivered):
 
 ```bash
-curl -s localhost:8000/v1/dead-letters?kind=webhook -H 'X-API-Key: dev-ops-key'
+curl -s 'localhost:8000/v1/dead-letters?kind=webhook' -H 'X-API-Key: dev-ops-key'
 ```
 
 ```bash

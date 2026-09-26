@@ -43,7 +43,7 @@ One Docker Compose project with 7 services on one bridge network. The trust boun
 | `sftp` (debian:trixie-slim + openssh-server) | Meridian DMZ SFTP | 2222 → 22 | M2 | built (M2) |
 | `soap-mock` (FastAPI) | `RateQuoteService` | 8080 | M2 | built (M2) |
 | `webhook-sink` (FastAPI) | A shipper's webhook receiver | 9000 (HTTPS since M7) | M2 | built (M2), TLS with a lab CA (M7) |
-| `gateway-api` | `meridian-gateway-api` | 8000 | M8 | planned |
+| `gateway-api` | `meridian-gateway-api` | 8000 | M5/M8 | code built (M4–M7), runs on the host via `make api-local`; container in M8 |
 | `sftp-poller` | sftp-poller worker | none | M3/M8 | code built (M3), runs on the host via `make poll-local`; container in M8 |
 | `webhook-dispatcher` | webhook-dispatcher worker | none | M7/M8 | code built (M7), runs on the host via `make dispatch-local`; container in M8 |
 
@@ -94,6 +94,14 @@ One Docker Compose project with 7 services on one bridge network. The trust boun
 | 41 | The ingest upsert reports insert vs update with Postgres 18 `RETURNING old.*, new.*` (not the `xmax = 0` trick) | Needed to emit `shipment.created` vs `shipment.status_changed` with `previous_status`; documented, not an implementation detail | M7 |
 | 42 | Every dead-letter replay attempt is audited in `dead_letter_replays`, including rejected and already-resolved ones; a webhook replay re-queues the *same* delivery and is resolved only when the dispatcher delivers it | Spec section 9 "Repudiation"; a 202 is not a delivery | M7 |
 | 43 | `rate_quote.completed` is emitted only when a quote is stored (`complete()`), never on a replay, a failure or a released key | One event per quote, in the same transaction as the quote row | M7 |
+| 44 | Known gap, not closed: a DNS-rebinding window remains between the SSRF check's lookup and httpx's own connect. A hostile name server can answer "public" then "internal"; TLS verification stops the request body, but the TCP connect and ClientHello reach the internal address (blind port probing). Per-attempt checks only defeat *slow* DNS changes | Closing it needs connecting to the checked IP (a custom network backend) or the spec's egress proxy; production relies on the allow-listing egress proxy (PR #5 review, reproduced) | M7 |
+| 45 | `ssrf.guard()` adds checks on top of the spec's verbatim `assert_public_https`: NAT64 (`64:ff9b::/96`, `64:ff9b:1::/48`) and IPv4-compatible (`::/96`) addresses are judged by their embedded IPv4; URLs with whitespace, control characters or userinfo are refused (parsed with httpx's own parser); the lookup shares the attempt's 5 s budget (2 s in the API); a refusal's 422 detail is fixed text | Python's `is_global` is True for NAT64 of 169.254.169.254; `urlsplit` silently drops `\t\n\r` so the guard and the client read different URLs; the old 422 detail revealed internal DNS answers (PR #5 review, all reproduced) | M7 |
+| 46 | Signing-side secret rotation is not built: one secret per subscription, one `v1,` signature. The verifier already accepts several signatures | The spec's 24 h dual-signing needs a second secret column and an API to add it; planned, not needed for the gate | M7 |
+| 47 | A `410` disables the subscription, but siblings already in the same concurrent batch are still sent; their outcomes are ignored (410s are recorded first, and a cancelled row is never retried or dead-lettered) | Batch attempts run concurrently; grouping by subscription would serialise a shipper's deliveries (PR #5 review) | M7 |
+| 48 | `DELETE /v1/webhook-subscriptions/{id}` removes the subscription's deliveries, history included (`ON DELETE CASCADE`); its open webhook dead letters stay listed but replay answers `422` | The contract said "cancelled"; now it says what happens. Keeping history would need soft deletes | M7 |
+| 49 | Dispatcher hardening: the response body is never read (`client.stream`, `Accept-Encoding: identity`); `attempt()` never raises and each `record()` is isolated; every outcome write is fenced by the claim's lease (`next_attempt_at`) and `status = 'pending'`; the max age is checked by the database clock and the last retry is clamped to the end of the window; rows of a disabled subscription are cancelled at claim time | One receiver could crash the dispatcher for every tenant (InvalidURL, DecodingError) or exhaust its memory (gzip bomb); a late outcome could flip `delivered` to `dead`; DST made the age wrong in a zoned session (PR #5 review, all reproduced) | M7 |
+| 50 | At most 25 subscriptions per shipper (`422 subscription-limit-reached`); a second webhook replay while one is queued or in flight is `409 already-queued`; the replay audit records the ops key's fingerprint (`ops_key_id`, migration 0004); the ingest upsert never updates another owner's row (`WHERE s.client_id = EXCLUDED.client_id`) | Fan-out amplification; two replicas sending one row; every ops key shares one client_id; a replay racing the poller wrote one shipper's data into another's shipment (PR #5 review, reproduced) | M7 |
+| 51 | Known limits: a row replay has no staleness check (replaying an old line can move a status backwards); a quote whose `complete()` lost its lease is returned to the caller but emits no `rate_quote.completed`; the dev host allowance ignores the port; the lab CA has no name constraints | Recorded for the runbook and later milestones (PR #5 review) | M7 |
 
 ## Ingest data flow (M3)
 
@@ -120,9 +128,12 @@ poller batch / rate-quote complete()          ONE transaction
   outbox.enqueue: INSERT webhook_deliveries per matching ACTIVE subscription (fan-out)
                                │ commit (no event without its change, no change without its event)
 webhook-dispatcher, every 1 s
-  1. claim: due pending rows, FOR UPDATE SKIP LOCKED, next_attempt_at += 60 s lease; COMMIT
-  2. per row: SSRF guard -> sign(secret, delivery_id, ts, exact body) -> POST, 5 s total, no redirects
-  3. record:  2xx -> delivered (+ resolve an open webhook dead letter)
+  1. claim: due pending rows, FOR UPDATE SKIP LOCKED, next_attempt_at = now() + 60 s (the lease,
+     also the fencing token for step 3); COMMIT. A disabled subscription's rows are cancelled, not sent
+  2. per row: SSRF guard -> sign(secret, delivery_id, ts, exact body) -> POST, 5 s total for both,
+     no redirects, status code only (the body is never read)
+  3. record (only if the row still holds OUR lease; 410s first):
+              2xx -> delivered (+ resolve an open webhook dead letter)
               410 -> subscription disabled, its pending rows cancelled
               else -> retry in uniform(0, min(6 h, 30 s * 2^n)); past WEBHOOK_MAX_AGE -> dead + dead_letters
 ops: POST /v1/dead-letters/{id}:replay -> same delivery re-queued (audit row always)

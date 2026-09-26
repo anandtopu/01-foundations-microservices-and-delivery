@@ -18,12 +18,10 @@ from gateway.config import Settings
 from gateway.errors import ProblemError
 from gateway.resilience import BulkheadFull, CircuitBreaker, CircuitOpenError, RetryableError
 from gateway.soap.client import UpstreamRejected
+from tests.integration.conftest import API_TEST_URL as TEST_URL
+from tests.integration.conftest import OPS_KEY, OTHER_SHIPPER_KEY, SHIPPER_KEY
 
 BODY = {"origin_zip": "30301", "dest_zip": "60601", "weight_lb": 1200, "service_level": "FTL"}
-from tests.integration.conftest import (  # noqa: E402
-    API_TEST_URL as TEST_URL,
-)
-from tests.integration.conftest import OPS_KEY, OTHER_SHIPPER_KEY, SHIPPER_KEY  # noqa: E402
 
 KEY = {"X-API-Key": SHIPPER_KEY, "Idempotency-Key": "test-key-0001-aaaa"}
 
@@ -697,3 +695,29 @@ async def test_revocation_takes_effect_within_the_cache_ttl(
         assert (await client.get(unknown, headers=headers)).status_code == 404  # still cached
         clock[0] += auth.CACHE_TTL_S + 0.1
         assert (await client.get(unknown, headers=headers)).status_code == 401  # expired: gone
+
+
+async def test_a_stored_quote_emits_one_rate_quote_completed_event(
+    ok: tuple[httpx.AsyncClient, Stub],
+) -> None:
+    """M7 outbox (difference 43): the event rides in the quote's own transaction, once; the
+    idempotent replay of the same key emits nothing more (PR #5 review: no test covered it)."""
+    client, _ = ok
+    assert POOL is not None
+    async with POOL.connection() as conn:
+        await conn.execute(
+            """INSERT INTO webhook_subscriptions
+                   (subscription_id, client_id, url, event_types, secret)
+               VALUES (gen_random_uuid(), 'ACME', 'https://93.184.216.34/h',
+                       '{rate_quote.completed}', 'whsec_dGVzdA==')"""
+        )
+    first = await client.post("/v1/rate-quotes", json=BODY, headers=KEY)
+    replay = await client.post("/v1/rate-quotes", json=BODY, headers=KEY)
+    assert (first.status_code, replay.headers["Idempotent-Replayed"]) == (201, "true")
+    async with POOL.connection() as conn:
+        cur = await conn.execute("SELECT event_type, payload FROM webhook_deliveries")
+        rows = await cur.fetchall()
+    assert len(rows) == 1
+    event_type, payload = rows[0]
+    assert event_type == "rate_quote.completed"
+    assert payload["data"]["quote_id"] == first.json()["quote_id"]

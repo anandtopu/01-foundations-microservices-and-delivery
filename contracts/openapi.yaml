@@ -136,6 +136,7 @@ paths:
               schema: { $ref: '#/components/schemas/RateQuote' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '409':
           description: A request with this `Idempotency-Key` is still in progress. Retry after the delay.
           headers:
@@ -188,6 +189,7 @@ paths:
               schema: { $ref: '#/components/schemas/RateQuote' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '422': { $ref: '#/components/responses/ValidationFailed' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -200,8 +202,10 @@ paths:
       summary: Register a webhook endpoint
       description: |
         The URL must be `https` and must resolve to a public address; private, loopback, link-local and
-        metadata addresses are refused (`422`, `type` ending in `/webhook-url-not-allowed`). The response
-        contains the signing `secret` exactly once. Store it: it cannot be retrieved again.
+        metadata addresses are refused (`422`, `type` ending in `/webhook-url-not-allowed`), as are URLs
+        with credentials, whitespace or control characters. A shipper can hold at most 25 subscriptions
+        (`422`, `type` ending in `/subscription-limit-reached`). The response contains the signing `secret`
+        exactly once (`Cache-Control: no-store`). Store it: it cannot be retrieved again.
       requestBody:
         required: true
         content:
@@ -219,9 +223,17 @@ paths:
               schema: { $ref: '#/components/schemas/WebhookSubscriptionCreated' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
-        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '422':
+          description: |
+            The body failed validation (see `errors`), the URL is not allowed (`/webhook-url-not-allowed`;
+            the detail never says why, so it cannot be used to probe our DNS), or the shipper already has
+            25 subscriptions (`/subscription-limit-reached`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/InternalError' }
 
@@ -243,6 +255,7 @@ paths:
               schema: { $ref: '#/components/schemas/WebhookSubscription' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '422': { $ref: '#/components/responses/ValidationFailed' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -251,12 +264,15 @@ paths:
       operationId: deleteWebhookSubscription
       tags: [Webhook subscriptions]
       summary: Delete a webhook subscription
-      description: Pending deliveries for this subscription are cancelled.
+      description: |
+        The subscription and its deliveries are removed: pending ones are never sent, and the delivery
+        history goes with it. Webhook dead letters for it stay listed but can no longer be replayed (`422`).
       responses:
         '204':
           description: Deleted
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '422': { $ref: '#/components/responses/ValidationFailed' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -323,11 +339,19 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
-          description: Already resolved; nothing to replay.
+          description: |
+            Already resolved (`/already-resolved`), or an earlier replay of this webhook is still queued or in
+            flight (`/already-queued`). The attempt is audited.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
-        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '422':
+          description: |
+            Replay rejected (`/replay-rejected`): the row still fails validation or would change a shipment's
+            owner, or the webhook's subscription is disabled or deleted. The attempt is audited.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/InternalError' }
 
@@ -494,7 +518,7 @@ components:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }
     Forbidden:
-      description: The API key is valid but lacks the required scope (`ops`).
+      description: The API key is valid but has the wrong scope (`ops` for dead letters, `shipper` for shipper endpoints).
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }

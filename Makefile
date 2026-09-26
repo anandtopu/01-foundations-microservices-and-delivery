@@ -107,7 +107,7 @@ LAB_WEBHOOKS = WEBHOOK_DEV_ALLOW_HOSTS=localhost WEBHOOK_CA_BUNDLE=secrets/webho
 api-local:  ## (M5) Run the gateway API on the host, :8000, against the mocks; Ctrl-C to stop
 	env $(HOST_ENV) $(LAB_WEBHOOKS) SOAP_BASE_URL=http://localhost:8080 uv run uvicorn gateway.app:app --port 8000 --no-server-header
 
-dispatch-local:  ## (M7) Run the webhook dispatcher on the host (WEBHOOK_MAX_AGE=120s for the demo); Ctrl-C to stop
+dispatch-local:  ## (M7) Run the webhook dispatcher on the host (demo: WEBHOOK_MAX_AGE=120s make dispatch-local); Ctrl-C to stop
 	env $(HOST_ENV) $(LAB_WEBHOOKS) uv run python -m gateway.webhooks.dispatcher
 
 load-quotes:  ## (M5) 50-VU k6 burst on POST /v1/rate-quotes (needs api-local); then check /__stats

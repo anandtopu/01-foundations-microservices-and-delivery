@@ -14,6 +14,7 @@ import base64
 import binascii
 import json
 import uuid
+from datetime import datetime
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -32,21 +33,36 @@ router = APIRouter()
 _SOURCE_KEYS = ("file_name", "line_no", "raw", "subscription_id", "event_type", "attempts")
 
 
-def encode_cursor(created_at: str, dead_letter_id: str, filters: dict[str, Any]) -> str:
+def encode_cursor(
+    resolved: bool, created_at: str, dead_letter_id: str, filters: dict[str, Any]
+) -> str:
     """Opaque, and bound to the filter it was issued for (contract: a cursor from another filter
-    is a 400)."""
-    blob = json.dumps({"c": created_at, "i": dead_letter_id, "f": filters}, sort_keys=True)
+    is a 400). It carries the full sort key: (resolved, created_at, id)."""
+    blob = json.dumps(
+        {"r": resolved, "c": created_at, "i": dead_letter_id, "f": filters}, sort_keys=True
+    )
     return base64.urlsafe_b64encode(blob.encode()).decode().rstrip("=")
 
 
-def decode_cursor(cursor: str, filters: dict[str, Any]) -> tuple[str, str]:
+def decode_cursor(cursor: str, filters: dict[str, Any]) -> tuple[bool, datetime, str]:
+    """Every field is type-checked here: a tampered cursor is a 400, never a 500 (PR #5 review)."""
     try:
         blob = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
-        if blob["f"] != filters:
-            raise ValueError("cursor was issued for another filter")
-        return str(blob["c"]), str(uuid.UUID(blob["i"]))
-    except (ValueError, KeyError, TypeError, binascii.Error) as exc:
-        raise ProblemError(400, "invalid-cursor", "Invalid cursor", str(exc)) from exc
+        if not isinstance(blob, dict) or blob.get("f") != filters:
+            raise ValueError("wrong filter")
+        resolved, created_at, dl_id = blob["r"], blob["c"], blob["i"]
+        if not (
+            isinstance(resolved, bool) and isinstance(created_at, str) and isinstance(dl_id, str)
+        ):
+            raise ValueError("wrong types")
+        at = datetime.fromisoformat(created_at)
+        if at.tzinfo is None:
+            raise ValueError("naive timestamp")
+        return resolved, at, str(uuid.UUID(dl_id))
+    except (ValueError, KeyError, TypeError, binascii.Error, UnicodeDecodeError) as exc:
+        raise ProblemError(
+            400, "invalid-cursor", "Invalid cursor", "Use a next_cursor from this same query."
+        ) from exc
 
 
 def view(row: tuple[Any, ...]) -> dict[str, Any]:
@@ -73,7 +89,7 @@ async def list_dead_letters(
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> dict[str, Any]:
     filters = {"kind": kind, "resolved": resolved}
-    after = decode_cursor(cursor, filters) if cursor else (None, None)
+    after = decode_cursor(cursor, filters) if cursor else (None, None, None)
     pool: AsyncConnectionPool = request.app.state.db
     async with pool.connection() as conn:
         cur = await conn.execute(
@@ -82,18 +98,28 @@ async def list_dead_letters(
                  FROM dead_letters
                 WHERE (%(kind)s::text IS NULL OR kind = %(kind)s)
                   AND (%(resolved)s::boolean IS NULL OR (resolved_at IS NOT NULL) = %(resolved)s)
+                  -- keyset on the contract's order: unresolved first, then newest first
                   AND (%(c)s::timestamptz IS NULL
-                       OR (created_at, dead_letter_id) < (%(c)s::timestamptz, %(i)s::uuid))
-                ORDER BY created_at DESC, dead_letter_id DESC
+                       OR (resolved_at IS NOT NULL) > %(r)s
+                       OR ((resolved_at IS NOT NULL) = %(r)s
+                           AND (created_at, dead_letter_id) < (%(c)s, %(i)s::uuid)))
+                ORDER BY resolved_at IS NOT NULL, created_at DESC, dead_letter_id DESC
                 LIMIT %(n)s""",
-            {"kind": kind, "resolved": resolved, "c": after[0], "i": after[1], "n": limit + 1},
+            {
+                "kind": kind,
+                "resolved": resolved,
+                "r": after[0],
+                "c": after[1],
+                "i": after[2],
+                "n": limit + 1,
+            },
         )
         rows = await cur.fetchall()
     page = [view(r) for r in rows[:limit]]
     more = len(rows) > limit
     last = page[-1] if page else None
     next_cursor = (
-        encode_cursor(last["created_at"], last["dead_letter_id"], filters)
+        encode_cursor(last["resolved"], last["created_at"], last["dead_letter_id"], filters)
         if more and last
         else None
     )
@@ -120,16 +146,32 @@ async def replay_webhook(conn: AsyncConnection, delivery_id: uuid.UUID | None) -
     fresh retry window. Resolved later, by the dispatcher, when it is actually delivered."""
     if delivery_id is None:
         return "rejected: the delivery no longer exists (subscription deleted)"
+    # Only a DEAD delivery is re-queued. A second replay while the first is still queued (or in
+    # flight under a dispatcher's lease) must not reset the lease: two replicas would send it at
+    # once (PR #5 review). `attempts` restarts for the new window; the old count stays in the
+    # dead letter's source.
     cur = await conn.execute(
         """UPDATE webhook_deliveries d
               SET status = 'pending', attempts = 0, next_attempt_at = now(),
                   window_start = now(), last_result = NULL
              FROM webhook_subscriptions s
             WHERE d.delivery_id = %s AND s.subscription_id = d.subscription_id
-              AND s.status = 'active'""",
+              AND s.status = 'active' AND d.status = 'dead'""",
         (delivery_id,),
     )
-    return "queued" if cur.rowcount == 1 else "rejected: the subscription is disabled"
+    if cur.rowcount == 1:
+        return "queued"
+    cur = await conn.execute(
+        """SELECT d.status, s.status FROM webhook_deliveries d
+             JOIN webhook_subscriptions s USING (subscription_id) WHERE d.delivery_id = %s""",
+        (delivery_id,),
+    )
+    found = await cur.fetchone()
+    if found is None:
+        return "rejected: the delivery no longer exists (subscription deleted)"
+    if found[1] != "active":
+        return "rejected: the subscription is disabled"
+    return "already_queued"  # pending (or in flight): the earlier replay is still running
 
 
 @router.post("/v1/dead-letters/{dead_letter_id}:replay")
@@ -152,11 +194,11 @@ async def replay_dead_letter(dead_letter_id: uuid.UUID, request: Request, who: O
         else:
             outcome = await replay_webhook(conn, delivery_id)
         await conn.execute(
-            """INSERT INTO dead_letter_replays (dead_letter_id, ops_client_id, outcome)
-               VALUES (%s, %s, %s)""",
-            (dead_letter_id, who.client_id, outcome),
+            """INSERT INTO dead_letter_replays (dead_letter_id, ops_client_id, ops_key_id, outcome)
+               VALUES (%s, %s, %s, %s)""",
+            (dead_letter_id, who.client_id, who.key_id, outcome),
         )
-        if outcome != "already_resolved":
+        if outcome not in ("already_resolved", "already_queued"):
             await conn.execute(
                 """UPDATE dead_letters
                       SET replay_count = replay_count + 1, last_replayed_at = now(),
@@ -167,6 +209,10 @@ async def replay_dead_letter(dead_letter_id: uuid.UUID, request: Request, who: O
     # The audit row is committed; now report the outcome.
     if outcome == "already_resolved":
         raise ProblemError(409, "already-resolved", "Already resolved", "Nothing to replay.")
+    if outcome == "already_queued":
+        raise ProblemError(
+            409, "already-queued", "Already queued", "An earlier replay is still being delivered."
+        )
     if outcome.startswith("rejected: "):
         raise ProblemError(
             422, "replay-rejected", "Replay rejected", outcome.removeprefix("rejected: ")
