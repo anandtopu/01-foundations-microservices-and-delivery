@@ -1,0 +1,10 @@
+# Deliberate, per-location lint exceptions (reviewed in M1; see docs/BUILD_LOG.md).
+# Anything NOT listed here still fails or warns as normal.
+contracts/openapi.yaml:
+  no-server-example.com:
+    # localhost:8000 is the real lab server, not a placeholder; Schemathesis is always given --url explicitly.
+    - '#/servers/0/url'
+  operation-4xx-response:
+    # Unauthenticated probes with no inputs have no 4xx to document; inventing one would make the contract lie.
+    - '#/paths/~1healthz/get/responses'
+    - '#/paths/~1readyz/get/responses'

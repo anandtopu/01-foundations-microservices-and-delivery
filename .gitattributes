@@ -1,2 +1,6 @@
 * text=auto
 *.sh text eol=lf
+Makefile text eol=lf
+*.sql text eol=lf
+# AS/400 exports: keep exact bytes (cp1252, CRLF). Never let git normalize them.
+fixtures/csv/*.csv -text

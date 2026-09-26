@@ -1,0 +1,80 @@
+# P01 lab topology. M2: Postgres + the three legacy stand-ins. M8 adds gateway-api, sftp-poller and webhook-dispatcher.
+# The project name scopes every container, network and volume, so `docker compose down -v` touches only this lab.
+name: meridian
+
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-gateway}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gateway}
+      POSTGRES_DB: ${POSTGRES_DB:-gateway}
+    ports:
+      - "127.0.0.1:5432:5432"   # host tools only; not exposed beyond the VM
+    volumes:
+      # PG 18 images keep data in a version-specific subdirectory: mount the parent, not .../data.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  sftp:
+    build: ./mocks/sftp
+    ports:
+      - "2222:22"
+    volumes:
+      - sftp-hostkeys:/var/lib/sftp-hostkeys          # stable host identity across rebuilds
+      # The drop directory. We play the IBM i job by writing files into ./var/sftp-drop on the host.
+      # Mounted read-only as a second layer under `internal-sftp -R`.
+      - ./var/sftp-drop:/srv/sftp/outbound/shipments:ro
+    healthcheck:
+      test: ["CMD", "ssh-keyscan", "-T", "2", "-t", "ed25519", "127.0.0.1"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  soap-mock:
+    build:
+      context: ./mocks
+      dockerfile: Dockerfile.python
+      args: { MOCK: soap }
+      secrets: [build_ca]
+    environment:
+      PORT: "8080"
+      SOAP_MOCK_LATENCY_MS: ${SOAP_MOCK_LATENCY_MS:-300}
+      SOAP_MOCK_MAX_CONCURRENCY: "5"
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/__health', timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  webhook-sink:
+    build:
+      context: ./mocks
+      dockerfile: Dockerfile.python
+      args: { MOCK: webhook-sink }
+      secrets: [build_ca]
+    environment:
+      PORT: "9000"
+    ports:
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/__health', timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+secrets:
+  # Optional CA bundle for a TLS-inspecting egress proxy, used ONLY at image build time (see mocks/Dockerfile.python).
+  # Set BUILD_CA_BUNDLE in .env on the cloud VM; elsewhere it defaults to an empty file.
+  build_ca:
+    file: ${BUILD_CA_BUNDLE:-/dev/null}
+
+volumes:
+  pgdata:
+  sftp-hostkeys:
