@@ -9,8 +9,10 @@ import logging
 import uuid
 
 from fastapi import FastAPI, Request
+from fastapi.dependencies.models import Dependant
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from psycopg_pool import PoolTimeout
 from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -148,6 +150,34 @@ def allowed_methods(request: Request) -> str:
         )
     ]
     return ", ".join(allowed)
+
+
+def declared_query(dependant: Dependant) -> set[str]:
+    names = {param.alias for param in dependant.query_params}
+    for sub in dependant.dependencies:
+        names |= declared_query(sub)
+    return names
+
+
+async def reject_unknown_query(request: Request) -> None:
+    """App-wide dependency: a query parameter the route does not declare is a 422, like an unknown
+    body field (extra="forbid"). Otherwise `?updatedSince=...` (a typo) is silently ignored and
+    the shipper gets EVERY shipment back instead of an error (found by Schemathesis, M8)."""
+    route = request.scope.get("route")
+    if not isinstance(route, APIRoute):
+        return
+    unknown = sorted(set(request.query_params) - declared_query(route.dependant))
+    if unknown:
+        raise RequestValidationError(
+            [
+                {
+                    "type": "extra_forbidden",
+                    "loc": ("query", name),
+                    "msg": "Unknown query parameter",
+                }
+                for name in unknown
+            ]
+        )
 
 
 def install(app: FastAPI) -> None:

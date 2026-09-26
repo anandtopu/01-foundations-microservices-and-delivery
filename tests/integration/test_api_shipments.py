@@ -173,3 +173,13 @@ async def test_405_lists_every_method_of_the_path(
         r = await c.request("OPTIONS", path, headers=ACME)
     assert (r.status_code, r.headers["Allow"]) == (405, allow)
     assert r.headers["content-type"] == "application/problem+json"
+
+
+@pytest.mark.parametrize(
+    "path", ["/v1/shipments?updatedSince=2026-09-24T09:15:00Z", "/v1/shipments/SHP001?x=1"]
+)
+async def test_unknown_query_parameters_are_422(client: httpx.AsyncClient, path: str) -> None:
+    """A typo'd filter used to be ignored: the shipper got every shipment (Schemathesis, M8)."""
+    r = await client.get(path, headers=ACME)
+    assert (r.status_code, r.json()["type"]) == (422, TYPE + "validation-failed")
+    assert r.json()["errors"][0]["message"] == "Unknown query parameter"

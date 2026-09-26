@@ -108,6 +108,7 @@ One Docker Compose project with 7 services on one bridge network. The trust boun
 | 55 | `docker image ls` on this VM reports DISK USAGE = unpacked + compressed layers (containerd image store, difference 1): the gateway image shows **179 MB** there, is 130 MB unpacked and 42 MB compressed | The gate is read with the spec's own command; the other two numbers are recorded so the classic-store figure (~130 MB) is not mistaken for a different result | M8 |
 | 56 | `/readyz` checks the SFTP drop with a credential-free probe (TCP connect + `SSH-2.0-` banner), not an SFTP login | The API container never holds the SFTP private key; the poller's own errors and the ingest-age alert cover "our key no longer works" | M8 |
 | 57 | Gateway containers run with a read-only root filesystem, `tmpfs /tmp`, `cap_drop: [ALL]` and `no-new-privileges`; each gets only its own secrets (poller: SFTP key + `known_hosts`; dispatcher: the lab CA); `make keys` chowns the SFTP key to uid 10001 | Compose file-secrets are bind mounts that keep host ownership: a root-owned `0600` key is unreadable to `USER 10001` | M8 |
+| 58 | Stricter input than FastAPI's defaults: an undeclared query parameter is `422` on every route (one app-level dependency), and `updated_since` must be an RFC 3339 date-time with an offset (pydantic's lax mode also took `0.5` as a Unix timestamp) | A typo'd filter (`updatedSince`) was silently ignored, returning every shipment; both found by Schemathesis's `negative_data_rejection` | M8 |
 
 ## Ingest data flow (M3)
 
