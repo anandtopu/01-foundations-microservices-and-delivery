@@ -70,7 +70,7 @@ One Docker Compose project with 7 services on one bridge network. The trust boun
 | 17 | `QuoteInput` Protocol types the adapter's `q` parameter | The SOAP layer must not import the API layer | M4 |
 | 18 | `CircuitOpenError` carries `retry_after` (time left until the half-open trial), and the breaker exposes `retry_after()` | The contract promises `Retry-After` on every 503; a circuit-open 503 should say when a trial will be admitted, not a constant | M5 |
 | 19 | `Bulkhead.in_flight` counter alongside the semaphore | Tests and the section 8 bulkhead gauge need to read occupancy; the semaphore stays the only limit | M5 |
-| 20 | `POST /v1/rate-quotes` exists from M5, without auth or idempotency storage; `Location` points at a `GET` that M6 adds | The M5 gate (503 in under 10 ms, k6 burst) needs a real HTTP surface; M6 adds the key store and GET, M8 auth | M5 |
+| 20 | `POST /v1/rate-quotes` exists from M5 (auth, idempotency and `GET` arrived in M6) | The M5 gate (503 in under 10 ms, k6 burst) needs a real HTTP surface | M5 |
 | 21 | Retry-After: `2` for a saturated bulkhead and for retries exhausted (ADR-P01-1), ceil(time to trial) for an open circuit, `1` while a half-open trial is in flight | The contract requires the header; RFC 9110 delay-seconds are whole numbers, so round up and never send 0 | M5 |
 
 | 22 | Circuit breaker: a call remembers the generation it was admitted in (bumped on every open); a stale result does not change the state, and only the call that owns the half-open trial may clear the trial flag | The spec's breaker let a call admitted while CLOSED that succeeded after the breaker opened close it at once, skipping the cool-down and the single trial; stale failures pushed `opened_at` back; any finishing call could admit a second trial (PR #3 review, reproduced) | M5 |
@@ -78,6 +78,11 @@ One Docker Compose project with 7 services on one bridge network. The trust boun
 | 24 | A success response whose TotalCharge/Currency/TransitDays break the contract is `502 upstream-invalid-response` (not the shipper's fault); TotalCharge is normalised to 2 decimals; a junk QuoteRef is omitted | `int()`/pass-through let `"1e3"`, `"usd"`, `-4` and a 23-digit day count into a 201 (PR #3 review) | M5 |
 | 25 | `RequestGuard` middleware: `413` over 64 KiB (also for chunked bodies), `415` for a non-JSON body; 404/405 and malformed JSON (`400`) are Problem Details; `errors[]` capped at 20 with RFC 6901 pointers; `instance` on 500 | FR-8 "every error"; spec section 9's 64 KB limit; a 10.5 MB body produced a 22 MB 422 (PR #3 review) | M5 |
 | 26 | No `/openapi.json`, no `server` header | FastAPI's generated schema differs from the design-first contract; the server header is needless disclosure | M5 |
+
+| 27 | API-key auth arrives in M6, not M8: `api_keys` table (SHA-256 hash, client_id, scope `shipper`/`ops`, revocable, several active keys per client for rotation with overlap), `python -m gateway.auth add` (key from `$API_KEY`, never argv) and `make dev-keys` | Idempotency is keyed by `(client_id, key)` (ADR-P01-2), so the gateway must know the caller before M6 can work | M6 |
+| 28 | A failed upstream call deletes the in-progress key (`release`), so the same key can be retried; only a 201 is stored for replay | The contract's 503 promises "nothing was stored against your Idempotency-Key"; replaying a 503 would pin a transient failure to the key for 24 h | M6 |
+| 29 | Quote responses (first, replay and GET) are rendered as canonical JSON (sorted keys, compact) | Replays come back from `jsonb`, which reorders object keys: without this the M6 gate saw 2 distinct bodies for 20 clients | M6 |
+| 30 | `rate_quotes` stores the exact 201 body; `GET /v1/rate-quotes/{id}` filters on `client_id` and `expires_at` | The GET must return the same document as the POST (byte-identical), and another shipper's or an expired quote is "not found" (BOLA) | M6 |
 
 ## Ingest data flow (M3)
 

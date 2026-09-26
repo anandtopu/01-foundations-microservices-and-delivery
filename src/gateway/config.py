@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     database_url: str = "postgresql://gateway:gateway@postgres:5432/gateway"
+    db_pool_size: int = Field(default=10, ge=1)  # API only; the poller uses its own connection
 
     # --- SFTP drop (FR-1) ---
     sftp_host: str = "sftp"
