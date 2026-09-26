@@ -4,7 +4,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 COMPOSE ?= docker compose
 
-.PHONY: help setup sync lint fmt typecheck test cov check contract-lint keys mocks pin-hostkey migrate up down logs schemathesis audit reset drop
+.PHONY: help setup sync lint fmt typecheck test cov check contract-lint keys base-images mocks pin-hostkey migrate up down logs schemathesis audit reset drop
 
 help:  ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-15s %s\n", $$1, $$2}'
@@ -42,7 +42,19 @@ keys:  ## (M2) Generate the gateway SFTP key into secrets/ (skips if present)
 	@test -f secrets/gateway_ed25519 || ssh-keygen -t ed25519 -N "" -C gateway@meridian-lab -f secrets/gateway_ed25519
 	cp secrets/gateway_ed25519.pub mocks/sftp/gateway_ed25519.pub
 
-mocks:  ## (M2) Start Postgres and the legacy stand-ins
+# Docker Hub allows 100 anonymous pulls/h per egress IP, and the cloud VM shares its IP, so we hit 429.
+# mirror.gcr.io is Google's read-through cache of Docker Hub: same image digests, no Hub quota. We pull only
+# what is missing and tag it under the Docker Hub name, so Dockerfiles and compose.yaml stay unchanged.
+BASE_IMAGES ?= library/postgres:18 library/debian:trixie-slim library/python:3.14-slim docker/dockerfile:1
+IMAGE_MIRROR ?= mirror.gcr.io
+
+base-images:  ## (M2) Pre-pull missing base images via mirror.gcr.io (avoids Docker Hub 429s)
+	@for i in $(BASE_IMAGES); do n=$${i#library/}; \
+	  if docker image inspect "$$n" >/dev/null 2>&1; then echo "have $$n"; \
+	  else docker pull -q "$(IMAGE_MIRROR)/$$i" && docker tag "$(IMAGE_MIRROR)/$$i" "$$n" && echo "pulled $$n via $(IMAGE_MIRROR)"; fi; \
+	done
+
+mocks: base-images  ## (M2) Start Postgres and the legacy stand-ins
 	$(COMPOSE) up -d --build postgres sftp soap-mock webhook-sink
 
 pin-hostkey:  ## (M2) Pin the SFTP host key under the name the workers use ("sftp")

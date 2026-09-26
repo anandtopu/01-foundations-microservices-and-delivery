@@ -15,6 +15,8 @@ One section per milestone, in the order built. Every number here was measured in
 | k6 | v2.3.0 | v2.3.0 | GitHub release download OK |
 | Container apt | `deb.debian.org` → **403** | n/a | Blocks the M2 SFTP image until the host is added to the network allowlist |
 | Container pip | `CERTIFICATE_VERIFY_FAILED` | n/a | The session proxy's CA is not trusted inside containers; fix at build time with a BuildKit secret (M2/M8) |
+| Container apt (session 3) | `deb.debian.org` → **200** | n/a | Now reachable; the M2 SFTP image builds |
+| Docker Hub | **429** on a shared egress IP (`ratelimit-limit: 100;w=3600`, 3 left at session 3 start) | n/a | Workaround: `make base-images` pulls via `mirror.gcr.io` (see M2) |
 
 ---
 
@@ -154,16 +156,87 @@ Zero errors and zero unexplained warnings. `openapi-spec-validator`: `OK`. `make
 
 ---
 
-## M2 — Local legacy environment   (IN PROGRESS, 2026-09-26, session 2)
+## M2 — Local legacy environment   (2026-09-26, sessions 2–3)
 
-*The full section is written when the gate passes. This records the state so a VM reclaim loses nothing.*
+**Goal / requirement served:** the test harness for FR-1/FR-2 (SFTP ingest), FR-3/FR-5 (SOAP quotes behind a bulkhead), FR-6/FR-7 (signed webhooks); ADR-P01-1 (the 5-concurrent limit is reproduced, not assumed); spec section 12 rows "chroot ownership" and "host key mismatch".
 
-**Session 2 start:** the VM was reclaimed and restored between M1 and M2 (`uptime` 0 min, disk intact, processes gone). `cloud-setup.sh` restarted `dockerd` through the new auto-start path (`INFO: docker daemon not running; starting dockerd`), the first live test of that fix.
+**What we built:**
+- `mocks/sftp/Dockerfile`: `debian:trixie-slim` + `openssh-server` (10.0p1), a `gateway` user with a `nologin` shell, a root-owned chroot, and the gateway's public key in `authorized_keys`.
+- `mocks/sftp/sshd_config`: the spec's config verbatim (key auth only, `ChrootDirectory /srv/sftp`, `ForceCommand internal-sftp -R`) plus lab lines, each marked: `HostKey`, `PermitRootLogin no`, `KbdInteractiveAuthentication no` and `LogLevel VERBOSE`.
+- `mocks/sftp/entrypoint.sh`: generates the host key **once** onto the `sftp-hostkeys` volume, then `exec sshd -D -e`.
+- `mocks/soap/app.py`: the SOAP 1.1 RateQuoteService mock on :8080. It enforces the 5-in-flight limit (HTTP 500 + `soapenv:Server.Busy`) and adds `busy_rate` and `latency_ms` faults. The control plane is `GET /__stats` (calls, in-flight, **peak** concurrency), `POST /__faults` and `POST /__reset`. It parses with `defusedxml`.
+- `mocks/webhook-sink/app.py`: verifies Standard Webhooks HMAC signatures (supports multiple secrets, for rotation) and logs `signature=valid|invalid`. Its `__mode` endpoint makes it answer 410/500 and similar, for M7.
+- `mocks/Dockerfile.python`: one image for both Python mocks. The proxy CA is a BuildKit secret, so it is never in a layer. Runs as `USER 10001`.
+- `compose.yaml` (project `meridian`): `postgres:18`, `sftp` (2222:22), `soap-mock` (8080), `webhook-sink` (9000), each with a healthcheck. Postgres is published only on 127.0.0.1.
+- `fixtures/csv/SHPSTS_20260924_0915.csv`: a byte-exact cp1252/CRLF golden file with `SHIPPER_CODE` (decision A).
+- `tests/integration/test_mocks.py`: 6 behaviour tests of the mocks.
+- `Makefile`: `keys`, `mocks`, `pin-hostkey`, `drop`, and new this session, `base-images`. `README.md`: the M2 quick-start steps.
 
-**Done so far (pushed in `cc7da69`):** the SOAP mock, webhook sink, shared Python mock Dockerfile (proxy CA as a BuildKit secret, verified absent from the image), the SFTP Dockerfile, `sshd_config` and entrypoint, `compose.yaml`, the golden CSV with `SHIPPER_CODE` (decision A), `make drop`, `make keys` (key generated, gitignored). `postgres`, `soap-mock` and `webhook-sink` are up and healthy. `tests/integration/test_mocks.py`: 6/6 passed on 3 consecutive runs.
+**How it works:**
+- **Chroot:** sshd `chroot()`s the gateway user into `/srv/sftp` only if every path component up to it is `root:root` and not group- or world-writable. We verified `root:root 755` on `/srv/sftp`, `/srv/sftp/outbound` and `/srv/sftp/outbound/shipments`. If the rule is broken, sshd drops the connection *after* auth with "bad ownership or modes", which looks like a network failure (spec section 12).
+- **Read-only, twice:** `internal-sftp -R` refuses every write request at the protocol level, and the drop directory is also bind-mounted `:ro`. The gate's `put` is denied by the first layer, before the filesystem is even involved.
+- **No shell:** `ForceCommand internal-sftp` means `ssh gateway@… id` gets "This service allows sftp connections only." The `nologin` shell is a second layer.
+- **Host identity survives rebuilds:** the host key lives on a named volume, so `docker compose build` does not mint a new key and break every pinned `known_hosts`. On a new VM the volume is gone, so the key is new and must be re-pinned (as we did this session).
+- **Pinning under `sftp`:** the workers connect to the Compose service name `sftp` on port 22, so ssh and asyncssh look up the key under `sftp`. A keyscan of `localhost:2222` records it under `[localhost]:2222`, a different name, so the workers would fail. `make pin-hostkey` reads the public key from **inside** the container (a trusted channel) and writes it under `sftp`. From the host we use `-o HostKeyAlias=sftp` to verify against that same entry.
+- **Fault injection:** the gateway's resilience code (M5) is only as good as the failures it has been tested against. The mock makes "above 5 concurrent → `Server.Busy`" deterministic, so "peak ≤ 4" at `/__stats` is a measurement, not a hope.
+- **Rate-limit workaround:** `make base-images` pulls missing base images from `mirror.gcr.io` (Google's read-through cache of Docker Hub, with the same digests) and tags them under the Hub name, so no Dockerfile changes. `docker/dockerfile:1` is included because the `# syntax=` line makes BuildKit fetch that frontend from Hub too.
 
-**Debugged:** `test_above_five_concurrent_is_server_busy` expected peak concurrency 8 for 8 simultaneous calls and got 6. The mock logs showed rejected calls finish in about 1 ms, so they barely overlap each other. The test's model was wrong, not the mock: exceeding the limit always yields a peak of at least 6, which is what the test now asserts (and why "peak ≤ 4" is a sound M5 gate).
+**Commands run, in order (session 3):**
+1. `bash scripts/cloud-setup.sh`: exit 0, **no WARN lines**. `INFO: docker daemon not running; starting dockerd`. Docker 29.3.1, Compose v5.1.1.
+2. `curl -w '%{http_code}' https://deb.debian.org/debian/dists/trixie/Release` → `200` (it was 403 in session 2).
+3. `uv sync --locked`, then `make keys`: a new ed25519 key in `secrets/`, whose `.pub` is copied into the build context (both gitignored).
+4. `.env` from `.env.example` with `BUILD_CA_BUNDLE=/root/.ccr/ca-bundle.crt` uncommented.
+5. `docker compose up -d --build …` (in the background) → **429** on `python:3.14-slim`; a retry of just `sftp` → **429** on `debian:trixie-slim`.
+6. Docker Hub rate-limit probe → `ratelimit-limit: 100;w=3600`, `ratelimit-remaining: 3`, source `160.79.106.130` (shared egress). `mirror.gcr.io/v2/` → 401 (reachable; 401 is the normal auth challenge). `quay.io` → proxy 403.
+7. `docker pull mirror.gcr.io/library/{debian:trixie-slim,python:3.14-slim,postgres:18}` and `mirror.gcr.io/docker/dockerfile:1`, then `docker tag` → all OK.
+8. `docker compose up -d --build postgres sftp soap-mock webhook-sink` → all 4 `(healthy)`; apt inside the build fetched from `deb.debian.org`. Image sizes: sftp 160 MB, soap-mock 217 MB, webhook-sink 216 MB.
+9. `make pin-hostkey` → `sftp ssh-ed25519 AAAA…` (`SHA256:T3MXTgEr+hUc7l8eJKwt7yeeWtLHiWJtelsSn0QOBew`, the same fingerprint the entrypoint logged). Cross-checked against `ssh-keyscan -t ed25519 -p 2222 localhost` → MATCH.
+10. `make drop F=fixtures/csv/SHPSTS_20260924_0915.csv`, then the gate (below).
+11. `uv run pytest tests/integration/test_mocks.py -q` → `6 passed`.
 
-**Blocked:**
-1. `docker compose build sftp` → `403 Forbidden` from `deb.debian.org` (trixie, trixie-updates, trixie-security). The host gets the same 403: a network-policy block.
-2. Trying `ubuntu:24.04` as a plan B → Docker Hub `429 Too Many Requests` (anonymous pull rate limit on a shared egress IP).
+**Verification:** the Done-when gate. It is the spec's command, plus `HostKeyAlias=sftp` (see "What broke" 3), plus explicit `StrictHostKeyChecking=yes`, run in batch mode:
+
+```text
+$ sftp -b batch.txt -i secrets/gateway_ed25519 -P 2222 -o UserKnownHostsFile=secrets/known_hosts \
+       -o HostKeyAlias=sftp -o StrictHostKeyChecking=yes gateway@localhost:/outbound/shipments
+sftp> pwd
+Remote working directory: /outbound/shipments
+sftp> ls -l
+-rw-r--r--    ? 0        0             347 Sep 26 17:48 SHPSTS_20260924_0915.csv
+-rw-r--r--    ? 0        0               0 Sep 26 17:48 SHPSTS_20260924_0915.csv.done
+sftp> -put probe.txt
+dest open "/outbound/shipments/probe.txt": Permission denied
+sftp> bye
+```
+
+Negative controls, to prove that the pin is what lets us in:
+
+| Case | Result |
+|---|---|
+| Same command **without** `HostKeyAlias` (the key is pinned under `sftp`, not `[localhost]:2222`) | `Host key verification failed.` exit 255 |
+| An empty `known_hosts` | `Host key verification failed.` exit 255 |
+| `ssh gateway@… id` (asking for a shell) | `This service allows sftp connections only.` |
+
+sshd log: `Accepted publickey for gateway … ED25519 SHA256:64hkPe…`, which is the key from `make keys`.
+
+**What broke and how we fixed it:**
+1. *(session 2)* `test_above_five_concurrent_is_server_busy` expected a peak of 8 and got 6. Rejected calls return in about 1 ms, so they barely overlap each other. The test's model was wrong, not the mock, so it now asserts peak ≥ 6.
+2. *(sessions 2–3)* The SFTP build was blocked. *Session 2:* `deb.debian.org` returned 403 (network policy), and `ubuntu:24.04` as a plan B got a Hub 429. *Session 3:* Debian is now allowlisted, but Hub returned 429 on `python:3.14-slim` and then on `debian:trixie-slim`. *Hypothesis:* an anonymous per-IP quota. *Evidence:* the rate-limit headers show 3 of 100 left, on a shared egress IP. *Root cause:* the quota is shared with other tenants, so it is outside our control. *Fix:* `make base-images` through `mirror.gcr.io`, which leaves the Dockerfiles unchanged and needs no credentials. `make mocks` now depends on it, so it is automatic.
+3. *A spec inconsistency (not changed; flagged):* the M2 gate pins with `ssh-keyscan -p 2222 localhost > secrets/known_hosts`, but section 6 (and `make pin-hostkey`) pins under `sftp`. They write different host names into the **same** file, and whichever runs last wins. If the section 6 pin runs last, the gate's command as written fails with "Host key verification failed". If the M2 keyscan runs last, the workers fail. The keyscan is also trust-on-first-use over the network. *Resolution in this lab:* one pin, under `sftp`, taken from inside the container, and the gate verified with `-o HostKeyAlias=sftp`. *Proposed spec fix:* change the gate's command to add `-o HostKeyAlias=sftp` and drop the keyscan line (or keep it only as a cross-check).
+4. *A self-inflicted false positive, caught:* my first cross-check used `ssh-keyscan -q`, which this OpenSSH doesn't have. Both variables came back empty, and `"" = ""` printed MATCH. I re-ran it with the right flags and a non-empty guard. Lesson: a check that can't fail isn't a check.
+
+**Cloud vs real customer environment:** Meridian's SFTP drop sits in their DMZ, reached over Direct Connect or a site-to-site VPN. Their security architect sends the host-key fingerprint **out of band** (a signed email or a ticket), and we compare it before pinning; nobody runs `ssh-keyscan` against production and trusts the answer. Our public key is registered through their change process, and access is IP-allowlisted. The SOAP service's concurrency limit is agreed in writing during a joint test window (ADR-P01-1). Nobody gets to inject faults into their production system, which is exactly why the mock exists. Base images come from the company's own registry mirror (Artifactory, ECR pull-through cache), never anonymously from Docker Hub.
+
+**Check yourself:**
+1. You change `/srv/sftp/outbound` to `chmod 775` owned by `root:gateway`. What does the gateway see when it connects, and where do you look to find out why?
+2. The poller runs in the `meridian` Compose network and connects to `sftp:22`. Why does a `known_hosts` produced by `ssh-keyscan -p 2222 localhost` not work for it, and why is the keyscan a weaker pin anyway?
+3. Why do we build a SOAP mock with fault injection instead of testing M5 against the "real" SOAP service in a shared test environment?
+
+<details><summary>answers</summary>
+
+1. Authentication **succeeds**, then the connection closes immediately ("Connection closed" / "broken pipe"). It looks like a network problem. The reason is only in the **server** log: `fatal: bad ownership or modes for chroot directory component "/srv/sftp/outbound/"`. sshd requires every component of `ChrootDirectory` to be root-owned and not group- or world-writable; otherwise the chrooted user could swap in their own `/etc` or libraries and escalate. Spec section 12: chroot ownership.
+2. Clients look up the key by the name and port they connect to. The keyscan writes `[localhost]:2222`, but the poller asks for `sftp` (port 22 needs no brackets), so the lookup misses and, with checking enforced, the connection is refused. The keyscan is also TOFU (trust on first use): whoever answers on that port at that moment gets pinned, with no second channel to confirm it. Reading the key from inside the container (or, at Meridian, an out-of-band fingerprint) is the trusted channel.
+3. You cannot make a real shared service produce `Server.Busy` on demand, at a controlled rate, or at a precise concurrency; and you must not load-test someone else's fragile production-like system. Without deterministic faults, the bulkhead, retry and breaker tests either never exercise the failure paths or pass by luck. `/__stats` peak concurrency also turns "we never exceed 4" into a number we can assert. Fault injection makes resilience testable, and it makes the limits reproducible in CI.
+</details>
+
+---

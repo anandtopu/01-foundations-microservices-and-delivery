@@ -2,7 +2,7 @@
 
 A learning build from the FDE Onboarding Handbook. A Python 3.14 FastAPI gateway sits in front of a legacy AS/400 SFTP drop and a fragile SOAP rate-quote service. It provides idempotent quotes, a bulkhead, retries and a circuit breaker, signed webhooks through an outbox, and RFC 9457 errors.
 
-**Status:** M0 (toolchain) and M1 (OpenAPI 3.1 contract) done; see [`docs/BUILD_LOG.md`](docs/BUILD_LOG.md). The build is done in Claude Code cloud sessions, following [`docs/CLOUD_BUILD_PROMPT.md`](docs/CLOUD_BUILD_PROMPT.md).
+**Status:** M0 (toolchain), M1 (OpenAPI 3.1 contract) and M2 (legacy stand-ins) done; see [`docs/BUILD_LOG.md`](docs/BUILD_LOG.md). The build is done in Claude Code cloud sessions, following [`docs/CLOUD_BUILD_PROMPT.md`](docs/CLOUD_BUILD_PROMPT.md).
 
 | Path | What it is |
 |---|---|
@@ -55,6 +55,42 @@ Lint the OpenAPI 3.1 contract (the M1 gate):
 
 ```bash
 make contract-lint
+```
+
+On the cloud VM, uncomment `BUILD_CA_BUNDLE` in `.env` so the mock images can `pip install` through the session's TLS proxy:
+
+```bash
+sed -i 's|^# BUILD_CA_BUNDLE=|BUILD_CA_BUNDLE=|' .env
+```
+
+Generate the gateway's SFTP key into the gitignored `secrets/` (regenerate on every new VM):
+
+```bash
+make keys
+```
+
+Start Postgres 18, the SFTP drop, the SOAP mock and the webhook sink (base images come via mirror.gcr.io if missing):
+
+```bash
+make mocks
+```
+
+Pin the SFTP host key under the name the workers use, `sftp`, read from inside the container rather than trusted off the network:
+
+```bash
+make pin-hostkey
+```
+
+Play the IBM i job: drop the golden CSV and then its `.done` trigger:
+
+```bash
+make drop F=fixtures/csv/SHPSTS_20260924_0915.csv
+```
+
+Open an SFTP session as the gateway (the M2 gate). Expect `sftp>`; `put` fails with `Permission denied`:
+
+```bash
+sftp -i secrets/gateway_ed25519 -P 2222 -o UserKnownHostsFile=secrets/known_hosts -o HostKeyAlias=sftp -o StrictHostKeyChecking=yes gateway@localhost:/outbound/shipments
 ```
 
 List every other target:

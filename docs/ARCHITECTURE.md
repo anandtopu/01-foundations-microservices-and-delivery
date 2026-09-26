@@ -39,10 +39,10 @@ One Docker Compose project with 7 services on one bridge network. The trust boun
 
 | Compose service | Stands in for | Published port | Built in | Status |
 |---|---|---|---|---|
-| `postgres` (postgres:18) | Managed Postgres | 5432 | M2 | planned |
-| `sftp` (debian:trixie-slim + openssh-server) | Meridian DMZ SFTP | 2222 → 22 | M2 | planned |
-| `soap-mock` (FastAPI) | `RateQuoteService` | 8080 | M2 | planned |
-| `webhook-sink` (FastAPI) | A shipper's webhook receiver | 9000 | M2 | planned |
+| `postgres` (postgres:18) | Managed Postgres | 127.0.0.1:5432 | M2 | built (M2) |
+| `sftp` (debian:trixie-slim + openssh-server) | Meridian DMZ SFTP | 2222 → 22 | M2 | built (M2) |
+| `soap-mock` (FastAPI) | `RateQuoteService` | 8080 | M2 | built (M2) |
+| `webhook-sink` (FastAPI) | A shipper's webhook receiver | 9000 | M2 | built (M2) |
 | `gateway-api` | `meridian-gateway-api` | 8000 | M8 | planned |
 | `sftp-poller` | sftp-poller worker | none | M3/M8 | planned |
 | `webhook-dispatcher` | webhook-dispatcher worker | none | M7/M8 | planned |
@@ -53,3 +53,5 @@ One Docker Compose project with 7 services on one bridge network. The trust boun
 |---|---|---|---|
 | 1 | Docker runs on a `dockerd` we start ourselves (cgroup v1, containerd image store) | The cloud VM ships dockerd but does not start it | M0 |
 | 2 | Container egress: `deb.debian.org` is blocked (403), and container TLS does not trust the session proxy's CA | Cloud network allowlist and proxy; affects image builds only | M0 (found), M2/M8 (handled) |
+| 3 | `deb.debian.org` is reachable as of session 3; Docker Hub returns 429 on the shared egress IP, so `make base-images` pulls base images from `mirror.gcr.io` and retags them | Anonymous Hub quota (100/h per IP) is shared with other tenants | M2 |
+| 4 | The SFTP host key is pinned once, under `sftp`, read from inside the container; the M2 gate uses `-o HostKeyAlias=sftp` instead of `ssh-keyscan -p 2222 localhost` | The spec's gate (M2) and deploy steps (section 6) pin under different names in the same file | M2 |
