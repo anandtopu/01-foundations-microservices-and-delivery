@@ -39,7 +39,7 @@ def test_cyymmdd(raw: str, expected: date) -> None:
     assert parse_cyymmdd(raw) == expected
 
 
-@pytest.mark.parametrize("raw", ["1261399", "12609", "abcdefg"])
+@pytest.mark.parametrize("raw", ["1261399", "12609", "abcdefg", "2260924", "12609 1", "+260924"])
 def test_cyymmdd_rejects_garbage(raw: str) -> None:
     with pytest.raises(ValueError):
         parse_cyymmdd(raw)
@@ -95,9 +95,15 @@ def test_resume_skips_committed_lines() -> None:
 @pytest.mark.parametrize(
     ("line", "reason"),
     [
-        ('"S1","O1","ACME","P",1260924,-5.00', "weight_lb: Input should be greater than or equal"),
+        ('"S1","O1","ACME","P",1260924,-5.00', "weight_lb: not a plain decimal number"),
+        ('"S1","O1","ACME","P",1260924,1e2', "weight_lb: not a plain decimal number"),
+        ('"S1","O1","ACME","P",1260924,1_000', "weight_lb: not a plain decimal number"),
         ('"S1","O1","ACME","P",1260924,1.234', "weight_lb: Decimal input should have no more than"),
-        ('"S1","O1","ACME","P",1260924,abc', "weight_lb: Input should be a valid decimal"),
+        ('"S1","O1","ACME","P",1260924,abc', "weight_lb: not a plain decimal number"),
+        ('"S1","O1","ACME","P",1260924,10000000000.00', "weight_lb: Decimal input should have no"),
+        ('"S1","O1","ACME","P",2260924,1.00', "ship_date: not a CYYMMDD date"),
+        ('"S1","O1","ACME","P",12609 1,1.00', "ship_date: not a CYYMMDD date"),
+        ('"S1","O\x001","ACME","P",1260924,1.00', "line contains a NUL byte"),
         ('"S1","O1","ACME","P",1261399,1.00', "ship_date: "),
         ('"S1","O1","      ","P",1260924,1.00', "shipper_code: blank key field"),
         ('"S1","O1","ACME","P",1260924', "expected 6 fields, got 5"),
@@ -145,3 +151,22 @@ def test_model_rejects_unknown_status_directly() -> None:
                 "weight_lb": "1",
             }
         )
+
+
+@pytest.mark.parametrize("sep", ["\x0c", "\x0b", "\x1c", "\r"])
+def test_odd_characters_inside_a_field_do_not_split_the_line(sep: str) -> None:
+    # PR #2 review: str.splitlines() split on these and shifted every later line number.
+    raw = HEADER + (
+        f'"S1","O{sep}1","ACME","P",1260924,1.00\r\n"S2","O2","ACME","Q",1260924,1.00\r\n'
+    ).encode("cp1252")
+    results = list(parse_export(raw))
+    assert [r.line_no for r in results] == [2, 3]
+    assert isinstance(results[1], DeadRow)
+    assert results[1].raw.startswith('"S2"')  # line 3 really is S2, as in the file
+
+
+def test_lf_only_files_parse_too() -> None:
+    raw = HEADER.replace(b"\r\n", b"\n") + b'"S1","O1","ACME","P",1260924,1.00\n'
+    (result,) = parse_export(raw)
+    assert isinstance(result, GoodRow)
+    assert result.raw == '"S1","O1","ACME","P",1260924,1.00'

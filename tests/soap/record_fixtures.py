@@ -35,7 +35,7 @@ def call(client: httpx.Client, origin: str) -> httpx.Response:
 def save(name: str, resp: httpx.Response) -> None:
     path = OUT / f"{name}.{resp.status_code}.xml"
     path.write_bytes(resp.content)
-    print(f"{path.relative_to(Path.cwd())}  ({len(resp.content)} bytes)")
+    print(f"{path}  ({len(resp.content)} bytes)")
 
 
 def main() -> None:

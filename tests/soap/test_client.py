@@ -4,6 +4,7 @@ Golden fixtures in fixtures/ were recorded from the mock (record_fixtures.py). T
 httpx.MockTransport, so these tests need no running service and never touch the network.
 """
 
+import asyncio
 from collections.abc import Callable
 from pathlib import Path
 
@@ -14,7 +15,8 @@ from pydantic import ValidationError
 
 from gateway.api.rate_quotes import RateQuoteRequest
 from gateway.resilience import RetryableError
-from gateway.soap.client import RQ_NS, UpstreamRejected, get_rate_quote, render_xml
+from gateway.soap import client as soap_client
+from gateway.soap.client import RQ_NS, UpstreamRejected, get_rate_quote, render_xml, xsd_decimal
 
 FIXTURES = Path(__file__).parent / "fixtures"
 QUOTE = RateQuoteRequest(
@@ -179,7 +181,7 @@ async def test_response_without_result_is_rejected() -> None:
         "<soapenv:Body/></soapenv:Envelope>"
     )
     async with replay(httpx.Response(200, text=empty)) as client:
-        with pytest.raises(UpstreamRejected, match="no GetRateQuoteResult"):
+        with pytest.raises(UpstreamRejected, match=r"no GetRateQuoteResult \(http 200\)"):
             await get_rate_quote(client, QUOTE)
 
 
@@ -201,8 +203,8 @@ BILLION_LAUGHS = b"""<?xml version="1.0"?>
 @pytest.mark.parametrize(
     ("body", "kind"),
     [
-        (XXE, "EntitiesForbidden"),
-        (BILLION_LAUGHS, "EntitiesForbidden"),
+        (XXE, "DTDForbidden"),  # forbid_dtd=True: refused at the DOCTYPE, before any entity
+        (BILLION_LAUGHS, "DTDForbidden"),
         (b"<html><body>502 from a proxy that lied about its status</body>", "ParseError"),
         (b"", "ParseError"),
     ],
@@ -212,3 +214,112 @@ async def test_hostile_or_malformed_responses_are_rejected(body: bytes, kind: st
     async with replay(httpx.Response(200, content=body)) as client:
         with pytest.raises(UpstreamRejected, match=kind):
             await get_rate_quote(client, QUOTE)
+
+
+# --- PR #2 security review: outcomes that used to escape unclassified or be misclassified --------
+
+FAULT = (
+    '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"><soapenv:Body>'
+    "<soapenv:Fault>{code}<faultstring>x</faultstring></soapenv:Fault>"
+    "</soapenv:Body></soapenv:Envelope>"
+)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [httpx.RemoteProtocolError("peer closed"), httpx.ReadError("reset"), httpx.WriteError("pipe")],
+    ids=["remote_protocol", "read", "write"],
+)
+async def test_dropped_connections_are_retryable(exc: httpx.HTTPError) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise exc
+
+    async with client_for(handler) as client:
+        with pytest.raises(RetryableError, match=type(exc).__name__):
+            await get_rate_quote(client, QUOTE)
+
+
+async def test_slow_drip_response_hits_the_total_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(soap_client, "DEADLINE_S", 0.3)
+
+    class Drip(httpx.AsyncByteStream):
+        async def __aiter__(self):  # type: ignore[no-untyped-def]
+            for _ in range(20):  # 20 x 0.05 s = 1 s: no single read is slow, the total is
+                await asyncio.sleep(0.05)
+                yield b" "
+
+    async with client_for(lambda _r: httpx.Response(200, stream=Drip())) as client:
+        with pytest.raises(RetryableError, match=r"no complete response within 0\.3 s"):
+            await get_rate_quote(client, QUOTE)
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "outcome", "match"),
+    [
+        (500, "<html><body>Error<br></body></html>", RetryableError, "http 500, unparseable"),
+        (500, "<ok/>", RetryableError, "http 500 without a SOAP fault"),
+        (429, "slow down", RetryableError, "http 429"),
+        (500, FAULT.format(code="<faultcode>soapenv:Server</faultcode>"), RetryableError, "Server"),
+        (
+            500,
+            FAULT.format(code="<soapenv:faultcode>soapenv:Server.Busy</soapenv:faultcode>"),
+            RetryableError,
+            r"soapenv:Server\.Busy",
+        ),
+        (
+            500,
+            FAULT.format(code="<faultcode>evil:NotServer.Busy</faultcode>"),
+            UpstreamRejected,
+            "NotServer",
+        ),
+        (400, "<html><body>Bad<br></body></html>", UpstreamRejected, "http 400"),
+        (200, '<?xml version="1.0" encoding="bogus-xyz"?><a/>', UpstreamRejected, "LookupError"),
+    ],
+    ids=[
+        "html500", "xml500_no_fault", "429", "generic_server_fault", "qualified_busy",
+        "spoofed_busy", "html400", "bogus_encoding",
+    ],
+)  # fmt: skip
+async def test_classification_the_breaker_can_rely_on(
+    status: int, body: str, outcome: type[Exception], match: str
+) -> None:
+    async with replay(httpx.Response(status, text=body)) as client:
+        with pytest.raises(outcome, match=match):
+            await get_rate_quote(client, QUOTE)
+
+
+async def test_unqualified_result_child_does_not_crash() -> None:
+    body = (
+        '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"><soapenv:Body>'
+        '<rq:GetRateQuoteResult xmlns:rq="urn:meridian:ratequote:v2"><rq:QuoteRef>M</rq:QuoteRef>'
+        "<plain>2</plain></rq:GetRateQuoteResult></soapenv:Body></soapenv:Envelope>"
+    )
+    async with replay(httpx.Response(200, text=body)) as client:
+        assert await get_rate_quote(client, QUOTE) == {"QuoteRef": "M", "plain": "2"}
+
+
+async def test_oversize_response_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(soap_client, "MAX_RESPONSE_BYTES", 100)
+    async with replay(httpx.Response(200, content=b"<a>" + b"x" * 500 + b"</a>")) as client:
+        with pytest.raises(UpstreamRejected, match="larger than 100 bytes"):
+            await get_rate_quote(client, QUOTE)
+
+
+def test_render_xml_applies_conversion_and_format_spec() -> None:
+    x, s = 1.5, "a&b"
+    assert render_xml(t"<a>{x:.0f}</a><b>{s!r}</b>") == "<a>2</a><b>&apos;a&amp;b&apos;</b>"
+
+
+@pytest.mark.parametrize("bad", ["\x00", "\x01", "\x0b", "\x1f", "￾"])
+def test_render_xml_refuses_xml_illegal_characters(bad: str) -> None:
+    value = f"ok{bad}"
+    with pytest.raises(ValueError, match=r"XML 1\.0 forbids"):
+        render_xml(t"<a>{value}</a>")
+
+
+@pytest.mark.parametrize(
+    ("weight", "text"),
+    [(1200, "1200"), (1200.5, "1200.5"), (1e-05, "0.00001"), (45000.0, "45000.0")],
+)
+def test_weights_render_as_plain_decimals(weight: float, text: str) -> None:
+    assert xsd_decimal(weight) == text

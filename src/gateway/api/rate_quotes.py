@@ -1,4 +1,4 @@
-"""POST /v1/rate-quotes (FR-3). M4: the request model. M6 adds the route, idempotency and storage.
+"""POST /v1/rate-quotes (FR-4). M4: the request model. M6 adds the route, idempotency and storage.
 
 The model mirrors `RateQuoteRequest` in contracts/openapi.yaml and is the first line of defence:
 nothing reaches the SOAP envelope unless it passed here.

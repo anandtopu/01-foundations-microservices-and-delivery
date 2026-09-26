@@ -4,10 +4,11 @@ Every legacy quirk lives here, in Pydantic `mode="before"` validators: space-pad
 CYYMMDD dates, one-letter status codes, Windows-1252 bytes. The rest of the gateway sees only clean,
 typed `ShipmentRow`s.
 
-`ShipmentRow` is the spec's code verbatim, plus two lab additions marked below.
+`ShipmentRow` and `parse_cyymmdd` are the spec's code, plus lab additions marked "lab".
 """
 
 import csv
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import date
@@ -26,6 +27,10 @@ FIELDS = ("shipment_id", "order_no", "shipper_code", "status", "ship_date", "wei
 def parse_cyymmdd(raw: str) -> date:
     """IBM i CYYMMDD: C=0 -> 19xx, C=1 -> 20xx. '1260924' -> 2026-09-24."""
     v = raw.strip().zfill(7)
+    # lab: exactly C + 6 digits, C in {0, 1}. int() alone accepts " 1" and "+1", and C=2..9 would
+    # silently produce 21xx..28xx dates (PR #2 review).
+    if not re.fullmatch(r"[01][0-9]{6}", v):
+        raise ValueError(f"not a CYYMMDD date: {raw!r}")
     return date(1900 + int(v[0]) * 100 + int(v[1:3]), int(v[3:5]), int(v[5:7]))
 
 
@@ -62,17 +67,22 @@ class ShipmentRow(BaseModel):
     def ibm_date(cls, v: str) -> date:
         return parse_cyymmdd(v)
 
-    # --- lab addition: numeric fields arrive right-aligned (" 845.00") ---
+    # --- lab addition: numeric fields arrive right-aligned (" 845.00"); plain digits only, since
+    #     Decimal() alone would also accept "1e2", "1_000" and "+5" (PR #2 review) ---
     @field_validator("weight_lb", mode="before")
     @classmethod
     def strip_number(cls, v: str) -> str:
-        return v.strip()
+        v = v.strip()
+        if not re.fullmatch(r"[0-9]+(\.[0-9]+)?", v):
+            raise ValueError(f"not a plain decimal number: {v!r}")
+        return v
 
 
 @dataclass(frozen=True, slots=True)
 class GoodRow:
     line_no: int
     row: ShipmentRow
+    raw: str  # kept so a row refused later (e.g. an owner change) can still be dead-lettered
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,7 +121,11 @@ def parse_export(raw: bytes, *, start_after: int = 1) -> Iterator[GoodRow | Dead
     newline inside a quoted field, so one physical line is one record; that keeps `line_no` and
     `raw` exact for the ops team.
     """
-    lines = decode(raw).splitlines()
+    # Split on LF only (CRLF and LF both work). str.splitlines() would also split on \x0b, \x0c,
+    # \x1c-\x1e and a bare \r, which can sit inside a field and would shift every later line_no.
+    lines = [line.removesuffix("\r") for line in decode(raw).split("\n")]
+    if lines and lines[-1] == "":
+        lines.pop()  # the file's final newline
     if not lines:
         raise FileRejected("empty file")
     header = tuple(h.strip().upper() for h in next(csv.reader([lines[0]])))
@@ -121,7 +135,14 @@ def parse_export(raw: bytes, *, start_after: int = 1) -> Iterator[GoodRow | Dead
     for line_no, line in enumerate(lines[1:], start=2):
         if line_no <= start_after or not line.strip():
             continue
-        values = next(csv.reader([line]))
+        if "\x00" in line:  # Postgres text cannot store NUL: refuse the line, not the batch
+            yield DeadRow(line_no, line, "line contains a NUL byte")
+            continue
+        try:
+            values = next(csv.reader([line]))
+        except csv.Error as err:  # e.g. a bare \r inside an unquoted field
+            yield DeadRow(line_no, line, f"unparseable CSV line: {err}")
+            continue
         if len(values) != len(FIELDS):
             yield DeadRow(line_no, line, f"expected {len(FIELDS)} fields, got {len(values)}")
             continue
@@ -130,4 +151,4 @@ def parse_export(raw: bytes, *, start_after: int = 1) -> Iterator[GoodRow | Dead
         except ValidationError as err:
             yield DeadRow(line_no, line, reason_of(err))
         else:
-            yield GoodRow(line_no, row)
+            yield GoodRow(line_no, row, line)

@@ -29,12 +29,15 @@ async def mock() -> AsyncIterator[httpx.AsyncClient]:
             (await client.get("/__health", timeout=1)).raise_for_status()
         except httpx.HTTPError:
             pytest.skip("soap-mock not running (make mocks)")
+        # Snapshot whatever fault settings are active and put them back afterwards, so running
+        # this gate never clobbers a later gate's setup (e.g. M5's busy_rate 1.0).
+        saved = (await client.get("/__stats")).json()["faults"]
         await client.post("/__faults", json={"latency_ms": 0, "busy_rate": 0, "max_concurrency": 5})
         await client.post("/__reset")
         try:
             yield client
         finally:
-            await client.post("/__faults", json={"latency_ms": 300, "busy_rate": 0})
+            await client.post("/__faults", json=saved)
             await client.post("/__reset")
 
 

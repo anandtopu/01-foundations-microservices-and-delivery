@@ -4,9 +4,10 @@ Uses a throwaway database, gateway_test, created fresh per test, so the lab data
 Needs `make mocks`; skips otherwise.
 """
 
+import datetime
 import importlib.util
 import socket
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,7 @@ from psycopg import AsyncConnection
 
 from gateway.config import Settings
 from gateway.ingest import poller
+from gateway.ingest.model import DeadRow, GoodRow, ShipmentRow
 from gateway.ingest.poller import RemoteFile, ingest_bytes
 from gateway.migrate import load, migrate
 
@@ -132,6 +134,99 @@ async def test_rejected_file_is_recorded_once(db: AsyncConnection) -> None:
     assert await scalar(db, "SELECT status FROM ingested_files") == "rejected"
 
 
+HEADER = b"SHIPMENT_ID,ORDER_NO,SHIPPER_CODE,STATUS,SHIP_DATE,WEIGHT_LB\r\n"
+
+
+def csv(*lines: str) -> bytes:
+    return HEADER + "".join(f"{line}\r\n" for line in lines).encode("cp1252")
+
+
+# --- PR #2 review: poison pills that used to crash the poller on every cycle ---------------------
+
+
+@pytest.mark.parametrize("second_status", ["P", "L"], ids=["identical", "changed"])
+async def test_same_shipment_twice_in_one_batch_last_line_wins(
+    db: AsyncConnection, second_status: str
+) -> None:
+    raw = csv(
+        '"S1","O1","ACME","P",1260924,1.00',
+        '"S2","O2","ACME","P",1260924,1.00',
+        f'"S1","O1","ACME","{second_status}",1260924,1.00',
+    )
+    res = await ingest_bytes(db, remote("dup.csv", raw), raw, batch_size=1000)
+    assert (res.status, res.rows_ok, res.rows_superseded) == ("done", 2, 1)
+    status = await scalar(db, "SELECT status FROM shipments WHERE shipment_id = 'S1'")
+    assert status == {"P": "picked", "L": "loaded"}[second_status]
+
+
+async def test_nul_bytes_are_dead_lettered_not_fatal(db: AsyncConnection) -> None:
+    raw = csv(
+        '"S1","O\x001","ACME","P",1260924,1.00',  # would be a good row, but text cannot hold NUL
+        '"S2","O2","ACME","Q",1260924,1.0\x00',  # a dead row whose raw text holds a NUL
+        '"S3","O3","ACME","P",1260924,1.00',
+    )
+    res = await ingest_bytes(db, remote("nul.csv", raw), raw, batch_size=1000)
+    assert (res.status, res.rows_ok, res.rows_dead) == ("done", 1, 2)
+    cur = await db.execute("SELECT reason, source->>'raw' FROM dead_letters ORDER BY line_no")
+    rows = await cur.fetchall()
+    assert [r[0] for r in rows] == ["line contains a NUL byte", "line contains a NUL byte"]
+    assert "\\x00" in rows[0][1]  # the evidence survives, escaped
+
+
+async def test_binary_file_is_rejected_not_fatal(db: AsyncConnection) -> None:
+    raw = b"\x1f\x8b\x08\x00" + bytes(range(1, 60))  # a gzip header dropped as .csv
+    res = await ingest_bytes(db, remote("gz.csv", raw), raw, batch_size=1000)
+    assert res.status == "rejected"
+    assert await scalar(db, "SELECT status FROM ingested_files") == "rejected"
+
+
+async def test_owner_change_is_refused(db: AsyncConnection) -> None:
+    first = csv('"S1","O1","ACME","P",1260924,1.00')
+    await ingest_bytes(db, remote("a.csv", first), first, batch_size=1000)
+    takeover = csv('"S1","O1","BOLT","D",1260924,1.00', '"S9","O9","BOLT","P",1260924,1.00')
+    res = await ingest_bytes(db, remote("b.csv", takeover), takeover, batch_size=1000)
+    assert (res.rows_ok, res.rows_dead, res.inserted) == (1, 1, ["S9"])
+    cur = await db.execute("SELECT client_id, status FROM shipments WHERE shipment_id = 'S1'")
+    assert await cur.fetchone() == ("ACME", "picked")  # untouched
+    reason = await scalar(db, "SELECT reason FROM dead_letters")
+    assert reason == "owner change refused: 'ACME' -> 'BOLT'"
+
+
+async def test_database_refusal_rejects_the_file_and_keeps_earlier_batches(
+    db: AsyncConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Safety net: if something the model did not anticipate reaches Postgres and it refuses it
+    (DataError), that file is rejected and the poller carries on, keeping committed batches."""
+    real = poller.parse_export
+
+    def poisoned(raw: bytes, *, start_after: int = 1) -> Iterator[GoodRow | DeadRow]:
+        yield from real(raw, start_after=start_after)
+        bad = ShipmentRow.model_construct(
+            shipment_id="S\x00", order_no="O", shipper_code="ACME", status="picked",
+            ship_date=datetime.date(2026, 9, 24), weight_lb=1,
+        )  # fmt: skip
+        yield GoodRow(99, bad, "poison")
+
+    monkeypatch.setattr(poller, "parse_export", poisoned)
+    raw = csv('"S1","O1","ACME","P",1260924,1.00')
+    res = await ingest_bytes(db, remote("p.csv", raw), raw, batch_size=1)
+    assert res.status == "rejected"
+    assert await scalar(db, "SELECT count(*) FROM shipments") == 1  # batch 1 was committed
+    reason = await scalar(db, "SELECT reason FROM dead_letters")
+    assert reason == (
+        "database refused the batch after line 2: DataError: "
+        "PostgreSQL text fields cannot contain NUL (0x00) bytes"
+    )
+
+
+async def test_ingest_refuses_a_connection_inside_a_transaction(db: AsyncConnection) -> None:
+    await db.execute("SELECT 1")  # opens an implicit transaction
+    raw = csv('"S1","O1","ACME","P",1260924,1.00')
+    with pytest.raises(RuntimeError, match="no open transaction"):
+        await ingest_bytes(db, remote("t.csv", raw), raw, batch_size=1000)
+    await db.rollback()
+
+
 class Crash(Exception):
     """Stands in for the process dying (OOM kill, docker restart) mid-batch."""
 
@@ -194,7 +289,7 @@ async def test_crash_mid_batch_resumes_exactly_once(
         assert await cur.fetchone() == ("done", 2501, 2450, 50)
 
 
-async def test_second_poller_waits_for_the_lock(db: AsyncConnection) -> None:
+async def test_second_poller_skips_its_cycle_while_locked(db: AsyncConnection) -> None:
     async with await AsyncConnection.connect(TEST_URL, autocommit=True) as other:
         await other.execute("SELECT pg_advisory_lock(%s)", (poller.POLLER_LOCK_KEY,))
         # poll_once returns before touching SFTP, so no SFTP settings are needed here.
@@ -206,10 +301,15 @@ def sftp_ready() -> bool:
 
 
 async def test_end_to_end_through_sftp(db: AsyncConnection, tmp_path: Path) -> None:
-    """The real poller cycle: pinned host key, key auth, .done trigger, read-only drop."""
+    """The real poller cycle: pinned host key, key auth, .done trigger, read-only drop.
+
+    Uses a private subdirectory of the drop: a lab poller (make poll-local) lists only the top
+    level, so it can never ingest these test files into the lab database.
+    """
     if not sftp_ready():
         pytest.skip("sftp not running or host key not pinned (make mocks pin-hostkey)")
-    drop = ROOT / "var" / "sftp-drop"
+    drop = ROOT / "var" / "sftp-drop" / "_e2e"
+    drop.mkdir(parents=True, exist_ok=True)
     name = "SHPSTS_20260101_0000_e2e.csv"
     (drop / name).write_bytes((CSV / "SHPSTS_20260924_0915.csv").read_bytes())
     pending = drop / "SHPSTS_20260101_0001_nodone.csv"  # no .done trigger: must be ignored
@@ -223,6 +323,7 @@ async def test_end_to_end_through_sftp(db: AsyncConnection, tmp_path: Path) -> N
             sftp_host_key_alias="sftp",
             sftp_key_path=ROOT / "secrets" / "gateway_ed25519",
             sftp_known_hosts=ROOT / "secrets" / "known_hosts",
+            sftp_remote_dir="/outbound/shipments/_e2e",
         )
         results = {r.file_name: r for r in await poller.poll_once(cfg)}
         assert (results[name].status, results[name].rows_ok, results[name].rows_dead) == (
@@ -236,6 +337,7 @@ async def test_end_to_end_through_sftp(db: AsyncConnection, tmp_path: Path) -> N
     finally:
         for p in (drop / name, drop / f"{name}.done", pending):
             p.unlink(missing_ok=True)
+        drop.rmdir()
 
 
 async def test_wrong_host_key_is_refused(db: AsyncConnection, tmp_path: Path) -> None:

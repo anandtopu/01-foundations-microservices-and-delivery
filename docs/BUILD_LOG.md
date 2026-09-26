@@ -302,7 +302,7 @@ $ docker compose exec postgres psql -U gateway -d gateway -c "select count(*) fr
 | Same bytes, new name | ✅ `inserted=0 updated=0`; `max(updated_at)` unchanged |
 | cp1252 golden (é/ñ/£/€) | ✅ stored as `CAFÉ-8801`, `PEÑA-8802`, `£REF-8803`, `€QT-8804` |
 | 7 shipments after all drops | ✅ `count(*) = count(distinct shipment_id) = 7` |
-| Crash inside batch 3 of a 2,500-row file, then resume | ✅ after the crash: checkpoint 2001, 1,960 rows; after the resume: 2,450 shipments, 50 dead letters, exactly once |
+| Crash inside batch 3 of a 2,500-row file, then resume (test; the real process-kill run is M9's) | ✅ after the crash: checkpoint 2001, 1,960 rows; after the resume: 2,450 shipments, 50 dead letters, exactly once |
 | Postgres stopped for ~10 s while polling | ✅ `poll failed: OperationalError …` every 5 s, no crash; recovered on its own |
 | Wrong host key | ✅ `HostKeyNotVerifiable` (test) |
 | CSV without `.done` | ✅ ignored (test) |
@@ -326,7 +326,7 @@ $ docker compose exec postgres psql -U gateway -d gateway -c "select count(*) fr
    - Lesson (again): a test proves nothing until you have seen it fail for the right reason.
 
 **Known limits (for later milestones or production):**
-- The last writer wins, **including `client_id`**. If a file reassigns a shipment to another shipper, it moves. At Meridian we'd dead-letter an owner change instead of applying it (the security architect's call).
+- ~~The last writer wins, including `client_id`.~~ Fixed in the PR #2 review: an owner change is now dead-lettered (`owner change refused`), and `client_id` is never updated.
 - File order is by name (the names carry the IBM i timestamp). An *older* file dropped late would overwrite newer statuses. A production fix compares a source timestamp or sequence number, if the IBM i team will add one.
 - Each file is held in memory while it is processed. That's about 1.2 MB for 20k rows, which is fine; a multi-GB export would need streaming.
 
@@ -353,7 +353,7 @@ $ docker compose exec postgres psql -U gateway -d gateway -c "select count(*) fr
 
 ## M4 — SOAP adapter with safe XML   (2026-09-26, session 3)
 
-**Goal / requirement served:** FR-3/FR-4 (rate quotes through Meridian's SOAP service), ADR-P01-1 (M5's retry loop needs a clean retryable/non-retryable split), and section 9's tampering row (XXE and entity expansion in SOAP responses: `defusedxml` for every parse).
+**Goal / requirement served:** FR-4 (rate quotes through Meridian's SOAP service), ADR-P01-1 (M5's retry loop needs a clean retryable/non-retryable split), and section 9's tampering row (XXE and entity expansion in SOAP responses: `defusedxml` for every parse).
 
 **What we built:**
 - `src/gateway/soap/client.py`: the spec's adapter verbatim, with three marked lab additions (see "How it works"). It builds the envelope with a Python 3.14 t-string and `render_xml`, POSTs with `SOAPAction` and a 3 s / 0.5 s-connect timeout, and parses with `defusedxml`.
@@ -367,7 +367,7 @@ $ docker compose exec postgres psql -U gateway -d gateway -c "select count(*) fr
 **How it works:**
 - **t-strings (PEP 750) make escaping structural.** `t"…{q.origin_zip}…"` is not a string; it's a `Template` of literal parts and `Interpolation` objects. `render_xml` escapes every interpolation and passes literal parts through untouched. There's no way to forget to escape, because the interpolated values never go through an f-string.
 - **Validation happens before rendering.** `RateQuoteRequest` (pattern `^[0-9]{5}$`) rejects `<x/>` before any XML exists. The escaping is defence in depth, not the only line of defence.
-- **Faults are classified by `faultcode`, not HTTP status.** SOAP 1.1 sends *every* fault as HTTP 500 (the two recorded fault fixtures prove it). `Server.Busy` becomes `RetryableError`; anything else (`Client`) becomes `UpstreamRejected`, because retrying a request the server called wrong just hammers it.
+- **Faults are classified by `faultcode`, not HTTP status.** SOAP 1.1 sends *every* fault as HTTP 500 (the two recorded fault fixtures prove it). `Server.Busy` becomes `RetryableError`; anything else (`Client`) becomes `UpstreamRejected`, because retrying a request the server called wrong just hammers it. (Refined in the PR #2 review: all `Server*` faults, other 5xx and 429 are retryable too.)
 - **Transport failures are retryable:** connect errors, timeouts and 502/503/504. This is safe **only** because `GetRateQuote` has no side effects. A call that creates something retries only with an upstream idempotency token, or not at all.
 - **defusedxml** refuses DTDs and entity declarations, so an XXE (`file:///etc/passwd`) or a billion-laughs response is rejected before expansion.
 - **Lab addition 1:** the `QuoteInput` Protocol types `q` without importing the API layer, so the dependencies point inwards.
@@ -411,7 +411,7 @@ $ uv run pytest tests/soap -q
 
 **What broke and how we fixed it:**
 1. *A test that could not fail (self-review, before the first run).* The first version of the `<x/>` test asserted that an empty `calls` list was empty; nothing ever appended to it. I replaced it with a transport that calls `pytest.fail` if an envelope is sent, and made the test follow the API's real sequence (validate, then call).
-2. *RUF043:* `pytest.raises(match="Server.Busy")` is a regex, and `.` matches any character, so `ServerXBusy` would also have passed. It is now `r"Server\.Busy"`. A small bug, but exactly the kind that hides a wrong fault code.
+2. *RUF043:* `pytest.raises(match="Server.Busy")` is a regex, and `.` matches any character, so `ServerXBusy` would also have passed. It is now `r"Server\.Busy"`. A small bug, but exactly the kind that hides a wrong fault code. The mapping to 502 and 503 is M6's job; M4 only classifies.
 3. *mypy `import-untyped` for defusedxml.* An `ignore` would have made every defusedxml call `Any` and hidden real type errors. I installed the typeshed stubs as a pinned dev dependency instead.
 
 **Spec observations (not changed, flagged):**
@@ -436,5 +436,53 @@ $ uv run pytest tests/soap -q
 - **Meridian changes the fault code** (for example `soapenv:Server.Overloaded`, or a SOAP 1.2 `Receiver` code). It falls through to `UpstreamRejected`: no retries, and shippers get 502s at peak instead of a 503 with `Retry-After`. Mitigation: a contract test against their test endpoint on every release, and an alert on the rate of `UpstreamRejected` by fault code.
 - **Their p99 creeps above 3 s.** Healthy but slow calls time out, get retried and add load. It needs latency SLO monitoring on the upstream, with the timeout reviewed jointly.
 - **A WSDL namespace bump** (`v2` → `v3`) makes the result lookup return `None`, so every quote becomes `UpstreamRejected: response has no GetRateQuoteResult`. The golden fixtures make this a failing test the day you re-record, not a production incident.
+
+---
+
+## PR #2 review — three independent review agents   (2026-09-26, session 3)
+
+**What happened:** before merging PR #2 (M3 + M4), three review agents read the diff in parallel, each with its own focus:
+1. M3 correctness and concurrency;
+2. security and M4 correctness;
+3. spec fidelity, gate honesty and the docs.
+
+Each ran its own reproductions (scratch databases, local test servers) and edited nothing. I re-verified every finding before fixing it, and each fix has a regression test. The critical fixes were also mutation-checked: reverting the fix makes its test fail.
+
+**Findings and outcomes:**
+
+| # | Finding (reviewer) | Severity | Reproduced? | Fix | Regression test |
+|---|---|---|---|---|---|
+| 1 | The same `shipment_id` twice in one batch → `CardinalityViolation`, which isn't caught → the poller crash-loops on that file forever and blocks every later file (M3) | **blocker** | yes, both by me and by the reviewer | The last line per shipment wins inside a batch; the rest are counted `superseded` | `test_same_shipment_twice_in_one_batch_last_line_wins[identical, changed]`; mutation (no dedupe) → `CardinalityViolation` |
+| 2 | A NUL byte in a line → `DataError` (text) or `UntranslatableCharacter` (jsonb) → the same crash loop; a binary file's *rejection* crashed too (M3) | **blocker** | yes, both by me and by the reviewer | NUL lines become dead letters; NULs in `raw` are escaped as `\x00`; a safety net rejects a file on any Postgres `DataError` and keeps going | `test_nul_bytes_are_dead_lettered_not_fatal`, `test_binary_file_is_rejected_not_fatal`, `test_database_refusal_rejects_the_file_and_keeps_earlier_batches` |
+| 3 | `splitlines()` splits on `\x0b \x0c \x1c-\x1e` and a bare `\r` → a record gets split and every later `line_no` is wrong (M3) | should-fix | yes (by the reviewer) | Split on LF only, then strip CR; a `csv.Error` becomes a dead letter | `test_odd_characters_inside_a_field_do_not_split_the_line[x0c, x0b, x1c, r]`, `test_lf_only_files_parse_too` |
+| 4 | Lenient parsing: `'12609 1'`, `'12609249'` and C=2..9 accepted as dates; `1e2` and `1_000` accepted as weights (M3, and spec code) | should-fix | yes | Strict `[01][0-9]{6}` and plain-digit checks (difference 12) | new `test_cyymmdd_rejects_garbage` and `test_bad_rows_become_dead_letters` cases |
+| 5 | A file could move a shipment to another shipper (BOLA) (M3) | should-fix (raised as a question in the PR) | by reading | `FOR UPDATE` owner check; an owner change becomes a dead letter; `client_id` is never updated | `test_owner_change_is_refused` |
+| 6 | The advisory lock sat on a separate idle connection: if only that one dies, a second poller can start (M3) | nit | by reading | The lock is taken on the working connection | the existing lock test, renamed `…_skips_its_cycle_while_locked` |
+| 7 | `ingest_bytes` inside an open transaction silently loses the per-batch checkpoints (M3) | nit | by reading | A `RuntimeError` guard | `test_ingest_refuses_a_connection_inside_a_transaction` |
+| 8 | A dropped connection (`RemoteProtocolError`, `ReadError`, `WriteError`) escaped unclassified → raw 500, invisible to M5 (M4) | should-fix | yes (by the reviewer) | Catch every `httpx.TransportError` → `RetryableError` | `test_dropped_connections_are_retryable[…]`; mutation → 3 failures |
+| 9 | httpx's timeout is per read, not a total → a slow-drip response took **10.1 s** (M4) | should-fix | yes (by the reviewer) | A total `asyncio.timeout(3.0)` per call | `test_slow_drip_response_hits_the_total_deadline`; mutation → failure |
+| 10 | A bogus `encoding=` declaration raised `LookupError`; an unqualified result child raised `IndexError` (M4) | should-fix | yes (by the reviewer) | Also catch `LookupError`/`ValueError`; use `rpartition` for tag names | `…[bogus_encoding]`, `test_unqualified_result_child_does_not_crash` |
+| 11 | HTML 500s, 500s without a Fault, generic `Server` faults and 429 were `UpstreamRejected` → the M5 breaker would never open (M4) | should-fix | yes (by the reviewer) | Those are now `RetryableError`; only `Client` faults and other 4xx are rejected (difference 16) | `test_classification_the_breaker_can_rely_on[8 cases]` |
+| 12 | `endswith("Server.Busy")` matched `evil:NotServer.Busy` and missed a qualified `<soapenv:faultcode>` (M4) | nit | yes (by the reviewer) | Compare the QName's local part; accept a qualified element too | `…[spoofed_busy, qualified_busy]` |
+| 13 | No response-size cap (a 300 MB body was buffered) (M4) | nit | yes (by the reviewer) | Stream, and refuse more than 1 MiB | `test_oversize_response_is_refused` |
+| 14 | `render_xml` dropped `!r` and format specs and passed XML-illegal characters; `str(1e-05)` isn't `xs:decimal` (M4) | nit | yes (by the reviewer) | `convert()` + `format()`, refuse illegal characters, `xsd_decimal()` | `test_render_xml_applies_conversion_and_format_spec`, `…_refuses_xml_illegal_characters`, `test_weights_render_as_plain_decimals` |
+| 15 | Defence in depth: `forbid_dtd=True`, hermetic SSH (`config=[]`), filenames logged with `%r` (log injection) (M4/M3) | nit | n/a | Applied | the XXE and billion-laughs tests now fail at the DOCTYPE (`DTDForbidden`) |
+| 16 | The e2e SFTP test wrote into the shared drop, so a running lab poller would ingest it (docs reviewer) | should-fix | yes (by me) | The test uses a private `_e2e/` subdirectory, which the lab poller never lists. **My first fix (skip if the lab lock is held) did not work:** the lock is held for milliseconds per cycle, so the check missed it. The subdirectory removes the race entirely. | e2e ran 3 times alongside `make poll-local`: lab `ingested_files` stayed at 2 |
+| 17 | The live SOAP tests reset the mock to hard-coded defaults, clobbering a later gate's settings. Also found: the **M2** test file left `busy_rate 1.0` behind on every run (docs reviewer, plus me) | should-fix | yes (by me) | Both fixtures snapshot and restore the actual fault settings | full suite → mock back at `busy_rate 0.0`; a custom `0.3` survived the tests |
+| 18 | Docs: undocumented deviations, a separate "M4 additions" table, FR-3 where FR-4 was meant, a 502 claim that is really M6's, the crash row not labelled as a test, gate counts depending on `make mocks`, a stale `.gitkeep`, and `record_fixtures.py` failing outside the repo root | should-fix / nit | yes | ARCHITECTURE differences 9–17 in one table; the other points corrected | n/a |
+
+**Not changed (with reason):**
+- **Status regression from an older file dropped late.** It needs a source timestamp or sequence number from the IBM i job, which is a data contract with Meridian. It stays a "Known limit" in M3.
+- **`RETURNING (xmax = 0)`.** It's an implementation detail, but widely used; it's now commented and pinned by a test.
+- **Hashing migration files as text.** `.gitattributes` forces `*.sql eol=lf`, so autocrlf can't change the checksum.
+- **The upstream `faultstring` in `UpstreamRejected`'s message.** It must not reach shippers. That's M6's job when it builds Problem Details (noted for M6).
+- **README's uv 0.12.19 vs the digest's 0.12.18.** This predates the PR and is recorded with evidence in "Session environment".
+
+**Verification after the fixes:**
+- `uv run pytest tests/soap -q` → **58 passed** (M4 gate; 3 of them need `make mocks`).
+- `make check` → ruff clean, `mypy --strict` clean, **160 passed**. The 22 integration and live tests need the stack (`make mocks`); without it they skip.
+- The M3 gate data is unchanged: 3 shipments from the sample, the same 2 dead-letter reasons.
+
+**Lesson:** three reviewers with different focuses found two crash loops that my own tests missed. My crash test proved exactly-once under a *clean* failure, and nobody had tried *hostile input*. "Hostile input is reachable" is the question to ask of every parser. A second lesson came from my own fix: my first e2e guard looked right and was wrong, and only running it against a live poller showed that.
 
 ---

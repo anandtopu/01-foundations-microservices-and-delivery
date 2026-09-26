@@ -59,26 +59,29 @@ One Docker Compose project with 7 services on one bridge network. The trust boun
 | 6 | `ingested_files` carries a `last_line` checkpoint and a status (`in_progress`, `done`, `rejected`) | The spec says "commit per 1,000-row batch"; a checkpoint that commits with each batch is what makes a restart mid-file exactly-once (M9 chaos row) | M3 |
 | 7 | A file with a bad header or undefined cp1252 bytes is rejected whole (one dead letter, line 1) | No row of a file we cannot decode can be trusted | M3 |
 | 8 | `SFTP_HOST_KEY_ALIAS` setting (asyncssh `host_key_alias`) | Lets the poller run on the host against `localhost:2222` while verifying the single `sftp` pin | M3 |
+| 9 | `render_xml` escapes `"` and `'` too, applies `!r`/format specs, and refuses XML 1.0-illegal characters | `saxutils.escape` covers only `& < >` (not enough in attribute values); the spec's helper silently dropped conversions/format specs and passed control characters that make the envelope ill-formed (PR #2 review) | M4 |
+| 10 | A malformed, DTD-bearing (`forbid_dtd=True`) or bogus-encoding SOAP response is classified, never an unclassified exception: `UpstreamRejected` on 2xx/4xx, `RetryableError` on 5xx/429. The API mapping (502/503) arrives in M6 | The spec's code lets `ParseError` / `EntitiesForbidden` / `LookupError` escape, which would be a raw 500 and bypass the M5 taxonomy | M4 |
+| 11 | `RateQuoteRequest` is `strict=True, extra="forbid"`, ZIP pattern `[0-9]{5}` (not `\d`) | Matches the contract exactly (`type: number`, `additionalProperties: false`), so M8 Schemathesis negative tests pass; `\d` would accept non-ASCII digits | M4 |
+| 12 | `ShipmentRow` extras beyond `shipper_code`: `weight_lb` is `Field(ge=0, max_digits=12, decimal_places=2)` and must be plain digits; `parse_cyymmdd` requires exactly `[01]` + 6 digits | A weight that overflows `numeric(12,2)` must dead-letter one row, not fail the batch; the spec's `int()`-based parsing accepted `'12609 1'`, `'12609249'` (8th digit dropped) and C=2..9 (year 2826); `Decimal` accepted `1e2` and `1_000` (PR #2 review) | M3 |
+| 13 | Lines are split on LF only (CRLF/LF), not `str.splitlines()`; a line with a NUL byte or unparseable CSV is a dead letter | `splitlines()` also splits on `\x0b \x0c \x1c-\x1e` and a bare `\r`, which shifted every later `line_no`; Postgres text cannot hold NUL, which crashed the poller (PR #2 review) | M3 |
+| 14 | The (name, size, mtime) fast path skips a finished file without downloading or hashing it; the (name, size, sha256) key stays the authoritative dedupe | FR-1 says "tracked by name, size and SHA-256"; hashing needs a download, and re-downloading every finished file every 60 s does not scale. mtime may only skip work, never decide identity | M3 |
+| 15 | Within a batch the last line for a shipment wins (earlier ones counted as `superseded`); a file may not change a shipment's `client_id` (dead letter `owner change refused`); a file Postgres refuses (`DataError`) is marked `rejected` and the loop continues | Postgres cannot update one row twice in one `INSERT ... ON CONFLICT` (a crash loop, PR #2 review); an owner change is a tenant-boundary (BOLA) violation, not an update; one poisoned file must not block every later file | M3 |
+| 16 | SOAP call: one total 3 s deadline (`asyncio.timeout`), every `httpx.TransportError` retryable, a 1 MiB response cap, `Server*` faults / other 5xx / 429 retryable, fault codes compared by QName local part; weights rendered as plain decimals | httpx's read timeout restarts per chunk (a slow drip took 10 s); `RemoteProtocolError` escaped unclassified; the spec's mapping made HTML 500s and generic `Server` faults non-retryable, so the M5 breaker would never open; `endswith` matched `evil:NotServer.Busy`; `str(1e-05)` is not `xs:decimal` (PR #2 review) | M4 |
+| 17 | `QuoteInput` Protocol types the adapter's `q` parameter | The SOAP layer must not import the API layer | M4 |
 
 ## Ingest data flow (M3)
 
 ```text
 IBM i job ──writes──> X.csv, then X.csv.done  (SFTP drop, read-only to us)
                                │
-sftp-poller, every 60 s (5 s demo), one active replica (pg_try_advisory_lock)
+sftp-poller, every 60 s (5 s demo), one active replica (pg_try_advisory_lock on the working connection)
   1. list the drop; keep X.csv only if X.csv.done exists
   2. fast path: (name, size, mtime) of a finished file? -> skip without download
   3. download; sha256; INSERT ingested_files ... ON CONFLICT (name, size, sha256) -> done? skip
   4. decode cp1252 -> header check -> ShipmentRow per line (resume after last_line)
   5. per 1,000 lines, ONE transaction:
-       upsert shipments (no-op if unchanged) + dead_letters (row) + last_line checkpoint
+       last line per shipment wins -> owner check (FOR UPDATE; a change is a dead letter)
+       -> upsert shipments (no-op if unchanged) + dead_letters (row) + last_line checkpoint
+     (Postgres DataError -> file rejected, loop continues)
   6. status = done
 ```
-
-### M4 additions to the differences log
-
-| # | Difference | Why | Milestone |
-|---|---|---|---|
-| 9 | `render_xml` also escapes `"` and `'` | `saxutils.escape` covers only `& < >`, which is safe in element text but not in attribute values; the spec's helper would be unsafe the day someone interpolates into an attribute | M4 |
-| 10 | A malformed or DTD/entity-bearing SOAP response raises `UpstreamRejected` (API: 502), never retried | The spec's code lets `ParseError` / `EntitiesForbidden` escape unclassified, which would surface as a raw 500 and bypass the M5 error taxonomy | M4 |
-| 11 | `RateQuoteRequest` is `strict=True, extra="forbid"`, ZIP pattern `[0-9]{5}` (not `\d`) | Matches the contract exactly (`type: number`, `additionalProperties: false`), so M8 Schemathesis negative tests pass; `\d` would accept non-ASCII digits | M4 |
