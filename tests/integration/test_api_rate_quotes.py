@@ -1,5 +1,5 @@
 """M5/M6: POST /v1/rate-quotes maps every outcome of the resilient call path to the contract:
-201 + Location, or RFC 9457 Problem Details (503 + Retry-After, 502, 422). The QuoteService is a
+201 + Location, or RFC 9457 Problem Details (503 + Retry-After, 422, 502). The QuoteService is a
 stub and the ASGI app runs in-process; since M6 (auth + idempotency) the API needs Postgres, so
 these tests use a throwaway, migrated database (gateway_api_test). Needs `make mocks`.
 """
@@ -92,7 +92,7 @@ async def test_created_quote_matches_the_contract(ok: tuple[httpx.AsyncClient, S
         (BulkheadFull("all 4 upstream slots busy"), 503, "upstream-saturated", "2"),
         (CircuitOpenError("open", retry_after=17.2), 503, "circuit-open", "18"),
         (RetryableError("Server.Busy"), 503, "upstream-busy", "2"),
-        (UpstreamRejected("soapenv:Client: origin ZIP not served"), 502, "upstream-rejected", None),
+        (UpstreamRejected("soapenv:Client: origin ZIP not served"), 422, "upstream-rejected", None),
     ],
     ids=["bulkhead_full", "circuit_open", "retries_exhausted", "client_fault"],
 )

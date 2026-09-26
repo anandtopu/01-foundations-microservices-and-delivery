@@ -1,0 +1,36 @@
+# Schemathesis configuration for the M8 gate (read automatically from the working directory, so the
+# spec's command runs unchanged: `uvx schemathesis run contracts/openapi.yaml ... --checks all`).
+#
+# ONE kind of adjustment only. `positive_data_acceptance` asserts that every request valid against the
+# JSON Schema is accepted. A few rejections are part of the contract but cannot be written as a
+# schema, because they depend on state or the outside world rather than on the request's shape. For
+# exactly those operations and exactly those statuses, the rejection is declared expected. Every other
+# check, and every other status, stays as strict as the default. (ARCHITECTURE difference 53.)
+
+# Default expected statuses for this check, plus the one documented semantic rejection per operation.
+
+[[operations]]
+# GET /v1/shipments: `cursor` is an opaque string (minLength 1, maxLength 512). Whether a string is a
+# cursor THIS server issued, for THIS filter, is not a schema property: a made-up one is `400
+# invalid-cursor` (contract: BadRequest, "a cursor that is not valid or was issued for another filter").
+include-operation-id = "listShipments"
+checks.positive_data_acceptance.expected-statuses = ["2XX", "400", "401", "403", "404", "409", "429", "5XX"]
+
+[[operations]]
+# GET /v1/dead-letters: the same opaque, filter-bound cursor.
+include-operation-id = "listDeadLetters"
+checks.positive_data_acceptance.expected-statuses = ["2XX", "400", "401", "403", "404", "409", "429", "5XX"]
+
+[[operations]]
+# POST /v1/webhook-subscriptions: whether `url` resolves only to public addresses is decided by DNS
+# at request time (SSRF guard), and the 25-per-shipper limit by what already exists: `422
+# webhook-url-not-allowed` / `422 subscription-limit-reached` (both documented on this operation).
+include-operation-id = "createWebhookSubscription"
+checks.positive_data_acceptance.expected-statuses = ["2XX", "401", "403", "404", "409", "422", "429", "5XX"]
+
+[[operations]]
+# POST /v1/rate-quotes: a well-formed body can still be `422` because of history (the same
+# Idempotency-Key was used with another body: /idempotency-key-reused) or because Meridian refuses
+# to quote it (an origin ZIP it does not serve: /upstream-rejected). Both documented on this operation.
+include-operation-id = "createRateQuote"
+checks.positive_data_acceptance.expected-statuses = ["2XX", "401", "403", "404", "409", "422", "429", "5XX"]

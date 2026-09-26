@@ -146,3 +146,22 @@ async def test_readiness_reports_each_dependency(api_pool: AsyncConnectionPool) 
         "not_ready",
         "error",
     )
+
+
+@pytest.mark.parametrize(
+    ("path", "allow"),
+    [
+        ("/v1/webhook-subscriptions/e3e70682-c209-1cac-a29f-6fbed82c07cd", "GET, DELETE"),
+        ("/v1/shipments", "GET"),
+        ("/v1/rate-quotes", "POST"),
+    ],
+)
+async def test_405_lists_every_method_of_the_path(
+    api_pool: AsyncConnectionPool, path: str, allow: str
+) -> None:
+    """Starlette's Allow named only the first route matching the path ("GET"), though DELETE is
+    served there too (RFC 9110 section 15.5.6; found by Schemathesis in M8)."""
+    async with app_client(api_pool) as c:
+        r = await c.request("OPTIONS", path, headers=ACME)
+    assert (r.status_code, r.headers["Allow"]) == (405, allow)
+    assert r.headers["content-type"] == "application/problem+json"
