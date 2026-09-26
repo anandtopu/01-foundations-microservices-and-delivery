@@ -56,7 +56,13 @@ async def main() -> int:
     print(f"distinct final bodies:  {len(bodies)}")
     print(f"quote_id:               {json.loads(next(iter(bodies))).get('quote_id', '?')}")
     print(f"mock /__stats:          {{'calls': {stats['calls']}}}")
-    ok = stats["calls"] == 1 and statuses == Counter({201: CLIENTS}) and len(bodies) == 1
+    # The spec's gate: one upstream call, 20 identical bodies, "some after 409 retries".
+    ok = (
+        stats["calls"] == 1
+        and statuses == Counter({201: CLIENTS})
+        and len(bodies) == 1
+        and seen["409"] > 0
+    )
     print("GATE:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 

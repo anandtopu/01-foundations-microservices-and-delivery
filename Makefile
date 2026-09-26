@@ -71,8 +71,11 @@ migrate-local:  ## (M3) Apply migrations from the host to the Compose Postgres
 
 dev-keys:  ## (M6) Store the .env dev API keys (hashed): DEV_SHIPPER_API_KEY -> ACME, DEV_OPS_API_KEY -> ops
 	@set -a; . ./.env; set +a; \
-	API_KEY="$$DEV_SHIPPER_API_KEY" env $(HOST_ENV) uv run python -m gateway.auth add --client ACME --scope shipper --label dev-shipper && \
-	API_KEY="$$DEV_OPS_API_KEY" env $(HOST_ENV) uv run python -m gateway.auth add --client meridian-ops --scope ops --label dev-ops
+	for spec in "$$DEV_SHIPPER_API_KEY ACME shipper dev-shipper" "$$DEV_OPS_API_KEY meridian-ops ops dev-ops"; do \
+	  set -- $$spec; \
+	  API_KEY="$$1" env $(HOST_ENV) uv run python -m gateway.auth add --client "$$2" --scope "$$3" --label "$$4" --allow-weak \
+	    || echo "  (already registered: fine for dev keys)"; \
+	done
 
 poll-local:  ## (M3) Run the sftp-poller on the host, every 5 s (demo interval); Ctrl-C to stop
 	env $(HOST_ENV) SFTP_POLL_INTERVAL_S=5 uv run python -m gateway.ingest.poller

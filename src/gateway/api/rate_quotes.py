@@ -7,6 +7,7 @@ The model mirrors `RateQuoteRequest` in contracts/openapi.yaml and is the first 
 nothing reaches the SOAP envelope unless it passed here.
 """
 
+import hashlib
 import json
 import logging
 import re
@@ -24,9 +25,9 @@ from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, ConfigDict, Field
 
 from gateway import idempotency
-from gateway.auth import Principal, principal
+from gateway.auth import Principal, shipper_principal
 from gateway.errors import ProblemError
-from gateway.resilience import Bulkhead, CircuitBreaker, retry_full_jitter
+from gateway.resilience import Bulkhead, CircuitBreaker, CircuitOpenError, retry_full_jitter
 from gateway.soap.client import UpstreamInvalidResponse, get_rate_quote
 
 # [0-9], never \d: in Python regexes \d also matches other scripts' digits ("٣٠٣٠١"), which the
@@ -105,7 +106,8 @@ IdempotencyKey = Annotated[
 ]
 
 
-Caller = Annotated[Principal, Depends(principal)]
+# Shipper keys only: ops keys are for ops endpoints, not quoting (spec section 9, PR #4 review).
+Caller = Annotated[Principal, Depends(shipper_principal)]
 
 
 class CanonicalJSON(JSONResponse):
@@ -134,17 +136,26 @@ async def create_rate_quote(
     service: QuoteService = request.app.state.quotes
     fingerprint = idempotency.request_hash(body.model_dump(mode="json"))
 
+    # 0. Circuit open: answer from what is stored (replay / 409 / 422) or fail fast, WITHOUT
+    #    claiming a key we would only release again. Keeps the M5 "503 in under 10 ms" promise
+    #    now that auth and idempotency sit in front of the breaker (PR #4 review).
+    open_for = service.breaker.open_for()
+    if open_for is not None:
+        async with pool.connection() as conn:
+            stored = await idempotency.peek(conn, who.client_id, idempotency_key, fingerprint)
+        if stored is not None:
+            return quote_response(stored[1], replayed=True)
+        raise CircuitOpenError("rate-quote circuit open", open_for)
+
     # 1. Claim the key, or learn that someone already has (409 / 422 / replay). Committed at once:
     #    the claim must be visible to concurrent duplicates BEFORE we call Meridian.
     async with pool.connection() as conn:
-        stored = await idempotency.begin(conn, who.client_id, idempotency_key, fingerprint)
-    if stored is not None:
-        code, stored_body = stored
-        return (
-            quote_response(stored_body, replayed=True)
-            if code == 201
-            else CanonicalJSON(stored_body, status_code=code)
-        )
+        claim = await idempotency.begin(conn, who.client_id, idempotency_key, fingerprint)
+    if not isinstance(claim, idempotency.Owned):
+        code, stored_body = claim  # only 201s are ever stored (failures release the key)
+        if code != 201:
+            raise RuntimeError(f"stored idempotent response has unexpected status {code}")
+        return quote_response(stored_body, replayed=True)
 
     # 2. We own the key. Call Meridian WITHOUT holding a database connection: a 4 s upstream call
     #    must not pin one of the pool's few connections.
@@ -154,8 +165,13 @@ async def create_rate_quote(
         # Nothing was stored against the key, so the shipper may retry with the SAME key
         # (contract, 503). A cancelled request (client gone) keeps its lease instead, which
         # expires in 30 s and is then taken over by the retry.
-        async with pool.connection() as conn:
-            await idempotency.release(conn, who.client_id, idempotency_key)
+        try:
+            async with pool.connection() as conn:
+                await idempotency.release(conn, who.client_id, idempotency_key, claim.token)
+        except Exception:
+            # Never let a failed release turn the real 503/502 into a 500: the lease expiry
+            # frees the key in 30 s anyway (PR #4 review).
+            log.exception("could not release idempotency key; its lease will expire")
         raise
 
     now = datetime.now(UTC)
@@ -179,8 +195,13 @@ async def create_rate_quote(
                VALUES (%s, %s, %s, %s, %s)""",
             (quote["quote_id"], who.client_id, Jsonb(quote), now, now + QUOTE_TTL),
         )
-        if not await idempotency.complete(conn, who.client_id, idempotency_key, 201, quote):
-            log.warning("idempotency key %r was taken over while we worked", idempotency_key)
+        if not await idempotency.complete(
+            conn, who.client_id, idempotency_key, claim.token, 201, quote
+        ):
+            # Our lease expired and a retry took the key over: it will store (and replay) its own
+            # result. Log a hash, not the key: keys are client-chosen and may carry identifiers.
+            digest = hashlib.sha256(idempotency_key.encode()).hexdigest()[:12]
+            log.warning("idempotency key sha256:%s was taken over while we worked", digest)
     return quote_response(quote)
 
 

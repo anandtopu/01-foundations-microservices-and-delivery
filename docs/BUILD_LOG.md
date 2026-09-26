@@ -706,7 +706,7 @@ I re-verified each finding (reproducing the most important one myself), fixed it
   - **`completed`** → the stored response, replayed with `Idempotent-Replayed: true`.
 - **The request hash is taken over the *validated* body, in canonical form** (sorted keys, compact). `{"weight_lb":1200}` and `{"weight_lb":1200.0}` in any key order are the same request; any real difference isn't.
 - **The claim is committed before Meridian is called,** so concurrent duplicates can see it. Meridian is then called **without holding a database connection**: a 4 s upstream call mustn't pin one of the pool's 10 connections. The quote and the key's completion are stored in **one transaction**, so a replay can never point at a quote that doesn't exist.
-- **`locked_until` is a 30 s lease.** If the owner dies mid-flight (OOM kill, deploy), the key would stay `in_progress` and every retry would get `409` forever. The spec's `DO UPDATE … WHERE locked_until < now()` lets a retry *take over* an abandoned key. `complete()` only updates a row still `in_progress`, so a slow original owner can't overwrite the new owner's result.
+- **`locked_until` is a 30 s lease.** If the owner dies mid-flight (OOM kill, deploy), the key would stay `in_progress` and every retry would get `409` forever. The spec's `DO UPDATE … WHERE locked_until < now()` lets a retry *take over* an abandoned key. (As first merged, `complete()` checked only `status = 'in_progress'`, which does **not** stop a slow original owner overwriting the new owner's result. The PR #4 review caught this, and the fix is a fencing token; see that section.)
 - **A failed call releases the key** (difference 28). The contract promises that a `503` stored nothing, so the shipper's retry with the *same* key must reach Meridian again. Replaying a transient `503` for 24 h would be wrong. A *cancelled* request (the client went away) keeps its lease instead, and the lease expires.
 - **Why the `DELETE` in `release()` can't race `begin()`'s `SELECT`:** Postgres locks the conflicting row during `INSERT … ON CONFLICT DO UPDATE` *even when the `WHERE` is false*. The duplicate's `INSERT` and `SELECT` share one transaction (the API pool isn't autocommit), so a concurrent `DELETE` waits for that transaction to end.
 - **Auth runs before body validation,** so an anonymous caller gets `401`, not a `422` that describes our schema. The database only ever sees `sha256(key)`. Rotation with overlap means two active rows for one `client_id`; the old one is then revoked with `revoked_at`.
@@ -729,6 +729,7 @@ idempotency key:        burst-fe71d1dc-6f6a-4823-91fd-f4c786cba870
 responses seen:         {'409': 19, '201': 1, '201 replayed': 19}
 final status per client: {201: 20}
 distinct final bodies:  1
+quote_id:               9ca698b5-ae76-4956-afb9-8460e0b713cf
 mock /__stats:          {'calls': 1}
 GATE: PASS
 ```
@@ -781,6 +782,57 @@ The spec's "expected: `{"calls": 1}`" holds. All 20 clients end with the same bo
 **What would break in production here (spec section 12):**
 - **A key-generation bug in a shipper's client** (the same key for every request): every quote after the first becomes a `422`, or worse, if their bodies match, a *replay of a stale quote* for up to 24 h. That's the client's bug, but it looks like ours. Log and alert on the replay rate per client.
 - **Postgres slow or down:** no quotes at all, even though Meridian is healthy, because we can't claim keys. That's the right trade-off for correctness. `/readyz` (M8) must reflect it, and a `503` beats a duplicate booking-style side effect.
-- **A lease shorter than the real upstream time:** if Meridian's p99 rose above 30 s (it's 2.8 s), a retry could take over a key whose owner is still working, and Meridian would be called twice. `complete()` stops the second write from clobbering the first, but the extra call has already happened. Keep the lease above the worst-case request time (bulkhead wait + retry budget).
+- **A lease shorter than the real upstream time:** if Meridian's p99 rose above 30 s (it's 2.8 s), a retry could take over a key whose owner is still working, and Meridian would be called twice. Since the PR #4 review, the fencing token means only the new owner's result is stored, and the stale owner can't delete the new claim. The extra call has still happened. Keep the lease above the worst-case request time (bulkhead wait + retry budget).
+
+---
+
+## PR #4 review — three independent review agents   (2026-09-26, session 3)
+
+**What happened:** before merging PR #4 (M6), three review agents read the diff in parallel, each with its own focus:
+1. idempotency correctness and concurrency, against its own scratch database;
+2. auth, security and contract;
+3. spec fidelity, gate honesty and the docs.
+
+The gate reviewer re-ran the M6 gate **3 out of 3 times: all PASS** (`calls: 1`, 1 distinct body), and `make check` reproduced 240. The idempotency reviewer confirmed the hard parts:
+- **Row lock:** the `ON CONFLICT` row lock is real, and holds for the length of the transaction.
+- **No race:** a 20-worker × 300-cycle stress run on one hot key gave zero errors (`{'409': 5699, 'own': 301}`).
+- **One owner:** 10 concurrent takeovers of an expired lease produced exactly one owner.
+- **Byte-identical round trips:** odd floats come back from `jsonb` byte-identical.
+
+The security reviewer confirmed tenant isolation: there was no cross-shipper replay, the 404s were identical, and revocation worked.
+
+**Findings and outcomes:**
+
+| # | Finding | Severity | Reproduced? | Fix | Regression test |
+|---|---|---|---|---|---|
+| 1 | **The M5 gate broke:** `load/quotes.js` sent no `X-API-Key`, so since M6 every k6 request was a `401` | should-fix (a regression I introduced) | yes (by the reviewer) | The script sends `API_KEY` (default: the dev key) | the k6 re-run below: 264 × 201, peak 4 |
+| 2 | **No fencing:** an owner whose lease expired could still `complete()`, and first writer wins (not "the original can't overwrite", as I had written). Its `release()` could delete the new owner's claim, so a third request could call Meridian *concurrently* | should-fix | yes (by the reviewer, with scripts) | `begin` returns the lease's `locked_until` as a token (`Owned`); `complete` and `release` require it. Difference 31. | `test_a_stale_owner_cannot_complete_after_a_takeover`, `…_cannot_release_the_new_owners_claim`; each fencing mutant fails its test |
+| 3 | **Circuit-open latency regression,** found by re-running M5 after the fixes: median 7.1 ms, max 10.9 ms, against M5's "under 10 ms" (was 1.2 ms), because M6 put auth + claim + release in front of the breaker | should-fix | yes (by me) | A read-only fast path when the breaker would refuse (`peek`: replay / 409 / 422, else fail fast with no claim), plus a 10 s cache of *valid* API keys. Difference 32. | `test_circuit_open_fast_path_claims_nothing_but_still_replays`, `test_revocation_takes_effect_within_the_cache_ttl`; live: **300 calls, median 2.5 ms, max 6.0 ms, 0 at or above 10 ms** |
+| 4 | `gateway.auth add` *resurrected* a revoked key, even as another tenant's `ops` key; an empty `$API_KEY` registered a random key it never showed | should-fix | yes (by the reviewer) | `ON CONFLICT DO NOTHING` with a non-zero exit; an empty key is refused; keys under 32 characters need `--allow-weak` (dev only). Difference 34. | `test_registering_an_existing_key_never_resurrects_or_moves_it`; `make dev-keys` now prints "already registered" |
+| 5 | An `ops` key could create quotes as a phantom shipper | should-fix | yes (by the reviewer) | `shipper_principal` returns 403 for non-shipper keys on quote endpoints. Difference 33. | `test_ops_keys_cannot_quote` |
+| 6 | A failing `release()` turned the real 503 into a 500; a starved pool (30 s wait) gave a 500 | should-fix | yes (by the reviewer) | The release is guarded and logged; the pool waits 5 s; `PoolTimeout` → `503 service-unavailable`. Difference 35. | `test_a_failed_release_does_not_hide_the_real_error`, `test_a_starved_pool_is_a_503_not_a_500` |
+| 7 | **Mutation-found gaps:** dropping the spec's `request_hash = EXCLUDED.request_hash` (takeover) or `status = 'in_progress'` (`complete`) left all 49 tests green | should-fix | yes (by the reviewer) | new tests | `test_taking_over_an_expired_lease_still_checks_the_body`, `test_complete_never_overwrites_a_completed_key` |
+| 8 | The 20-duplicate test depended on a 0.3 s sleep (and a pool of 5); the hash test couldn't fail; the cancellation lease wasn't tested | should-fix / nit | yes | The stub now parks on an `asyncio.Event` (deterministic, no polling); the hash test looks up `sha256(key)`; a cancellation test was added | `test_a_cancelled_request_keeps_its_lease`; 3 consecutive runs green |
+| 9 | The gate script didn't *assert* "some after 409 retries" | should-fix | yes | `seen["409"] > 0` is part of `ok` | the gate re-run |
+| 10 | `begin()` was called "verbatim" but had an unmarked `# type: ignore` and an inert `# fmt: skip`; the non-201 replay branch couldn't run | should-fix / nit | yes | `begin` is typed and returns `Owned` (lab markers); the unreachable branch became an explicit error | mypy now checks the replay path |
+| 11 | The ARCHITECTURE differences table didn't render: blank lines split rows 22–30 off it | should-fix | yes | blank lines removed; 36 rows in one table; row 36 lists the contract gaps (24 h retention, 429) | n/a |
+| 12 | BUILD_LOG: the false ownership claim, the gate output not verbatim, the lease bullet | should-fix / nit | yes | corrected in the M6 section | n/a |
+
+**Not changed (with reason):**
+- **Anonymous malformed or oversize bodies get 400/413/415 before 401.** These are generic and reveal no schema; the docstring now says so.
+- **An upstream success followed by a database failure strands the key until the lease expires.** The outcome is genuinely unknown to the shipper; the lease is the recovery path.
+- **An expired quote is still replayed as 201 by a completed key.** It's part of the retention gap, difference 36.
+- **Unsalted SHA-256** is acceptable for 32+ character random keys, which is now enforced outside dev.
+
+**Verification after the fixes (live, API on :8000, mock at 300 ms):**
+- **M6 gate:** `responses seen: {'409': 19, '201': 1, '201 replayed': 19}`, `distinct final bodies: 1`, `mock /__stats: {'calls': 1}`, `GATE: PASS` (it now also asserts the 409s).
+- **M5 breaker:** the breaker opens on the 2nd call (mock at 5 calls). 300 circuit-open calls took a median of **2.5 ms**, p99 3.9 ms and max **6.0 ms**, with 0 at or above 10 ms. The no-database baseline is a 0.7 ms median and 4.6 ms max.
+- **M5 k6 (50 VUs, 20 s, with key):** **264 × 201, 4,116 × 503**, all thresholds passed, mock **`peak_concurrency` 4**. Total requests fell to 4,380 (from 4,609), because every request now does its auth and idempotency work in Postgres.
+- **`make check`:** ruff and `mypy --strict` clean, **251 passed**. The 60 API tests need `make mocks`; without it they skip, with the reason printed.
+
+**Lessons:**
+- **A milestone can break an earlier milestone's gate.** M6's auth broke M5's k6 script, and M6's database path broke M5's latency promise. Re-running earlier gates after every milestone is cheap; finding out in M9 wouldn't be.
+- **"Only the owner may write" needs a token that proves ownership.** A status check says the work is unfinished, not *whose* it is: that is fencing.
+- **A tail-latency claim needs a sample and a baseline:** 300 calls, and a no-database control, rather than one lucky run.
 
 ---

@@ -11,6 +11,7 @@ import uuid
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from psycopg_pool import PoolTimeout
 from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -221,6 +222,17 @@ def install(app: FastAPI) -> None:
             "Rate service returned an unusable quote",
             "Meridian's rate service answered with data we cannot pass on. This is not a problem "
             "with your request; try again later.",
+        )
+
+    @app.exception_handler(PoolTimeout)
+    async def _pool(_: Request, exc: PoolTimeout) -> JSONResponse:
+        log.error("no database connection available: %s", exc)
+        return problem(
+            503,
+            "service-unavailable",
+            "Service temporarily unavailable",
+            "The gateway is overloaded. Nothing was stored; retry after the delay.",
+            retry_after=SATURATED_RETRY_AFTER_S,
         )
 
     @app.exception_handler(Exception)

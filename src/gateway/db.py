@@ -12,6 +12,9 @@ def make_pool(database_url: str, *, min_size: int = 1, max_size: int = 5) -> Asy
         min_size=min_size,
         max_size=max_size,
         open=False,
+        # Wait at most 5 s for a free connection (default 30 s): a starved pool must fail fast as
+        # a 503, not hold the shipper for half a minute (PR #4 review).
+        timeout=5.0,
         kwargs={"autocommit": False},
         # Replace connections Postgres dropped (restart, failover) instead of handing out dead ones.
         check=AsyncConnectionPool.check_connection,
