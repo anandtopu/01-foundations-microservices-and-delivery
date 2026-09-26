@@ -1,12 +1,15 @@
 """POST /v1/rate-quotes (FR-4).
 
-M4: the request model. M5: the resilient call path and a first route. M6 adds idempotency (the
-Idempotency-Key is validated here but not yet stored), quote storage and GET /v1/rate-quotes/{id}.
+M4: the request model. M5: the resilient call path. M6: API-key auth, idempotency keys (ADR-P01-2),
+quote storage and GET /v1/rate-quotes/{quote_id}.
 
 The model mirrors `RateQuoteRequest` in contracts/openapi.yaml and is the first line of defence:
 nothing reaches the SOAP envelope unless it passed here.
 """
 
+import hashlib
+import json
+import logging
 import re
 import uuid
 from dataclasses import dataclass
@@ -15,16 +18,23 @@ from decimal import Decimal
 from typing import Annotated, Literal
 
 import httpx
-from fastapi import APIRouter, Header, Request, Response
+from fastapi import APIRouter, Depends, Header, Request
+from fastapi.responses import JSONResponse
+from psycopg.types.json import Jsonb
+from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, ConfigDict, Field
 
-from gateway.resilience import Bulkhead, CircuitBreaker, retry_full_jitter
+from gateway import idempotency
+from gateway.auth import Principal, shipper_principal
+from gateway.errors import ProblemError
+from gateway.resilience import Bulkhead, CircuitBreaker, CircuitOpenError, retry_full_jitter
 from gateway.soap.client import UpstreamInvalidResponse, get_rate_quote
 
 # [0-9], never \d: in Python regexes \d also matches other scripts' digits ("٣٠٣٠١"), which the
 # contract's ECMA-262 pattern does not, and which Meridian's AS/400 would not understand.
 ZIP = r"^[0-9]{5}$"
 QUOTE_TTL = timedelta(minutes=15)  # FR-4: stored for 15 minutes
+log = logging.getLogger("gateway.rate_quotes")
 
 # What we accept from Meridian before it goes into a 201 (contract: RateQuote). Plain digits only:
 # int() and Decimal() alone would accept "-4", "1_0", "1e3" and non-ASCII digits (PR #3 review).
@@ -96,24 +106,116 @@ IdempotencyKey = Annotated[
 ]
 
 
+# Shipper keys only: ops keys are for ops endpoints, not quoting (spec section 9, PR #4 review).
+Caller = Annotated[Principal, Depends(shipper_principal)]
+
+
+class CanonicalJSON(JSONResponse):
+    """Sorted keys, compact separators. A replay is read back from jsonb, which stores object keys
+    in its own order, so without this the replayed bytes differ from the original response even
+    though the data is identical (found by the M6 gate: 2 distinct bodies for 20 clients)."""
+
+    def render(self, content: object) -> bytes:
+        return json.dumps(
+            content, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+        ).encode()
+
+
+def quote_response(body: dict[str, object], *, replayed: bool = False) -> JSONResponse:
+    headers = {"Location": f"/v1/rate-quotes/{body['quote_id']}"}
+    if replayed:
+        headers["Idempotent-Replayed"] = "true"
+    return CanonicalJSON(body, status_code=201, headers=headers)
+
+
 @router.post("/v1/rate-quotes", status_code=201)
 async def create_rate_quote(
-    body: RateQuoteRequest, request: Request, response: Response, idempotency_key: IdempotencyKey
-) -> dict[str, object]:
+    body: RateQuoteRequest, request: Request, who: Caller, idempotency_key: IdempotencyKey
+) -> JSONResponse:
+    pool: AsyncConnectionPool = request.app.state.db
     service: QuoteService = request.app.state.quotes
-    total, currency, transit_days, upstream_ref = contract_fields(await service.quote(body))
+    fingerprint = idempotency.request_hash(body.model_dump(mode="json"))
+
+    # 0. Circuit open: answer from what is stored (replay / 409 / 422) or fail fast, WITHOUT
+    #    claiming a key we would only release again. Keeps the M5 "503 in under 10 ms" promise
+    #    now that auth and idempotency sit in front of the breaker (PR #4 review).
+    open_for = service.breaker.open_for()
+    if open_for is not None:
+        async with pool.connection() as conn:
+            stored = await idempotency.peek(conn, who.client_id, idempotency_key, fingerprint)
+        if stored is not None:
+            return quote_response(stored[1], replayed=True)
+        raise CircuitOpenError("rate-quote circuit open", open_for)
+
+    # 1. Claim the key, or learn that someone already has (409 / 422 / replay). Committed at once:
+    #    the claim must be visible to concurrent duplicates BEFORE we call Meridian.
+    async with pool.connection() as conn:
+        claim = await idempotency.begin(conn, who.client_id, idempotency_key, fingerprint)
+    if not isinstance(claim, idempotency.Owned):
+        code, stored_body = claim  # only 201s are ever stored (failures release the key)
+        if code != 201:
+            raise RuntimeError(f"stored idempotent response has unexpected status {code}")
+        return quote_response(stored_body, replayed=True)
+
+    # 2. We own the key. Call Meridian WITHOUT holding a database connection: a 4 s upstream call
+    #    must not pin one of the pool's few connections.
+    try:
+        total, currency, days, ref = contract_fields(await service.quote(body))
+    except Exception:
+        # Nothing was stored against the key, so the shipper may retry with the SAME key
+        # (contract, 503). A cancelled request (client gone) keeps its lease instead, which
+        # expires in 30 s and is then taken over by the retry.
+        try:
+            async with pool.connection() as conn:
+                await idempotency.release(conn, who.client_id, idempotency_key, claim.token)
+        except Exception:
+            # Never let a failed release turn the real 503/502 into a 500: the lease expiry
+            # frees the key in 30 s anyway (PR #4 review).
+            log.exception("could not release idempotency key; its lease will expire")
+        raise
+
     now = datetime.now(UTC)
-    quote_id = uuid.uuid4()
-    response.headers["Location"] = f"/v1/rate-quotes/{quote_id}"
     quote: dict[str, object] = {
-        "quote_id": str(quote_id),
-        "request": body.model_dump(),
+        "quote_id": str(uuid.uuid4()),
+        "request": body.model_dump(mode="json"),
         "total_charge": total,
         "currency": currency,
-        "transit_days": transit_days,
+        "transit_days": days,
         "created_at": now.isoformat(),
         "expires_at": (now + QUOTE_TTL).isoformat(),
     }
-    if upstream_ref:  # optional in the contract: omit rather than send junk
-        quote["upstream_ref"] = upstream_ref
-    return quote
+    if ref:  # optional in the contract: omit rather than send junk
+        quote["upstream_ref"] = ref
+
+    # 3. Store the quote and the replayable response in ONE transaction: a replay can never point
+    #    at a quote that does not exist.
+    async with pool.connection() as conn, conn.transaction():
+        await conn.execute(
+            """INSERT INTO rate_quotes (quote_id, client_id, body, created_at, expires_at)
+               VALUES (%s, %s, %s, %s, %s)""",
+            (quote["quote_id"], who.client_id, Jsonb(quote), now, now + QUOTE_TTL),
+        )
+        if not await idempotency.complete(
+            conn, who.client_id, idempotency_key, claim.token, 201, quote
+        ):
+            # Our lease expired and a retry took the key over: it will store (and replay) its own
+            # result. Log a hash, not the key: keys are client-chosen and may carry identifiers.
+            digest = hashlib.sha256(idempotency_key.encode()).hexdigest()[:12]
+            log.warning("idempotency key sha256:%s was taken over while we worked", digest)
+    return quote_response(quote)
+
+
+@router.get("/v1/rate-quotes/{quote_id}")
+async def get_rate_quote_by_id(quote_id: uuid.UUID, request: Request, who: Caller) -> JSONResponse:
+    pool: AsyncConnectionPool = request.app.state.db
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            # client_id in the WHERE clause: another shipper's quote is "not found" (BOLA).
+            """SELECT body FROM rate_quotes
+                WHERE quote_id = %s AND client_id = %s AND expires_at > now()""",
+            (quote_id, who.client_id),
+        )
+        row = await cur.fetchone()
+    if row is None:
+        raise ProblemError(404, "not-found", "Not found", "No such quote for this API key.")
+    return CanonicalJSON(row[0])

@@ -116,6 +116,14 @@ class CircuitBreaker:
         self.state, self.opened_at = State.OPEN, time.monotonic()
         self._gen += 1
 
+    def open_for(self) -> float | None:
+        """lab: seconds until a trial is admitted if the breaker would refuse a call right now,
+        else None. Lets the API skip claiming an idempotency key it would only have to release
+        (M6 put the database in front of the breaker; PR #4 review re-measured the M5 gate)."""
+        if self.state is State.OPEN and time.monotonic() - self.opened_at < self.reset_after:
+            return self.retry_after()
+        return None
+
     def retry_after(self) -> float:
         """lab: seconds until the breaker will admit a trial call (for the Retry-After header)."""
         return max(0.0, self.reset_after - (time.monotonic() - self.opened_at))

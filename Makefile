@@ -4,7 +4,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 COMPOSE ?= docker compose
 
-.PHONY: help setup sync lint fmt typecheck test cov check contract-lint keys base-images mocks pin-hostkey migrate migrate-local poll-local poll-once api-local load-quotes up down logs schemathesis audit reset drop
+.PHONY: help setup sync lint fmt typecheck test cov check contract-lint keys base-images mocks pin-hostkey migrate migrate-local dev-keys poll-local poll-once api-local load-quotes up down logs schemathesis audit reset drop
 
 help:  ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-15s %s\n", $$1, $$2}'
@@ -68,6 +68,14 @@ HOST_ENV = DATABASE_URL=postgresql://gateway:gateway@localhost:5432/gateway \
 
 migrate-local:  ## (M3) Apply migrations from the host to the Compose Postgres
 	env $(HOST_ENV) uv run python -m gateway.migrate
+
+dev-keys:  ## (M6) Store the .env dev API keys (hashed): DEV_SHIPPER_API_KEY -> ACME, DEV_OPS_API_KEY -> ops
+	@set -a; . ./.env; set +a; \
+	for spec in "$$DEV_SHIPPER_API_KEY ACME shipper dev-shipper" "$$DEV_OPS_API_KEY meridian-ops ops dev-ops"; do \
+	  set -- $$spec; \
+	  API_KEY="$$1" env $(HOST_ENV) uv run python -m gateway.auth add --client "$$2" --scope "$$3" --label "$$4" --allow-weak \
+	    || echo "  (already registered: fine for dev keys)"; \
+	done
 
 poll-local:  ## (M3) Run the sftp-poller on the host, every 5 s (demo interval); Ctrl-C to stop
 	env $(HOST_ENV) SFTP_POLL_INTERVAL_S=5 uv run python -m gateway.ingest.poller

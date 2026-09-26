@@ -1,7 +1,7 @@
 """The gateway API: `uvicorn gateway.app:app` (or `make api-local`).
 
-M5 wires the rate-quote route to the resilience stack. Later milestones add shipments (FR-3),
-idempotency (M6), webhooks (M7), auth, /healthz and /readyz (M8).
+M5 wires the rate-quote route to the resilience stack; M6 adds the Postgres pool, API-key auth
+and idempotency. Later milestones add shipments (FR-3), webhooks (M7), /healthz and /readyz (M8).
 """
 
 from collections.abc import AsyncIterator
@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from gateway import errors
 from gateway.api import rate_quotes
 from gateway.config import Settings, get_settings
+from gateway.db import make_pool
 from gateway.resilience import Bulkhead, CircuitBreaker
 
 
@@ -24,7 +25,10 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
         # One pooled client for the process. Its pool is larger than the bulkhead on purpose: the
         # bulkhead, not the connection pool, is what limits concurrency towards Meridian.
         limits = httpx.Limits(max_connections=cfg.soap_max_concurrency * 2)
-        async with httpx.AsyncClient(base_url=cfg.soap_base_url, limits=limits) as client:
+        pool = make_pool(cfg.database_url, max_size=cfg.db_pool_size)
+        await pool.open(wait=True, timeout=10)  # a bad DSN fails at startup, not on request 1
+        app.state.db = pool
+        async with pool, httpx.AsyncClient(base_url=cfg.soap_base_url, limits=limits) as client:
             app.state.quotes = rate_quotes.QuoteService(
                 client=client,
                 bulkhead=Bulkhead(cfg.soap_max_concurrency, cfg.soap_bulkhead_wait_s),

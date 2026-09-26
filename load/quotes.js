@@ -10,6 +10,8 @@ import http from "k6/http";
 import { check } from "k6";
 
 const BASE_URL = __ENV.BASE_URL || "http://localhost:8000";
+// Since M6 every call needs a shipper key (`make dev-keys` registers the .env dev key).
+const API_KEY = __ENV.API_KEY || "dev-shipper-key";
 
 export const options = {
   scenarios: {
@@ -38,7 +40,7 @@ export default function () {
       service_level: "LTL_STANDARD",
     }),
     {
-      headers: { "Content-Type": "application/json", "Idempotency-Key": key },
+      headers: { "Content-Type": "application/json", "Idempotency-Key": key, "X-API-Key": API_KEY },
       tags: { name: "POST /v1/rate-quotes" },
     },
   );
