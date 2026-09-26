@@ -34,3 +34,10 @@ checks.positive_data_acceptance.expected-statuses = ["2XX", "401", "403", "404",
 # to quote it (an origin ZIP it does not serve: /upstream-rejected). Both documented on this operation.
 include-operation-id = "createRateQuote"
 checks.positive_data_acceptance.expected-statuses = ["2XX", "401", "403", "404", "409", "422", "429", "5XX"]
+
+[[operations]]
+# POST /v1/dead-letters/{id}:replay (ops key only, so the spec's shipper-key run sees 403): a real dead
+# letter can still be refused: `422 replay-rejected` (the row still fails validation or would change
+# a shipment's owner; the subscription is disabled or deleted), documented on this operation.
+include-operation-id = "replayDeadLetter"
+checks.positive_data_acceptance.expected-statuses = ["2XX", "401", "403", "404", "409", "422", "429", "5XX"]
