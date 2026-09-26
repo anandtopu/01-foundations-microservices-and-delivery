@@ -17,7 +17,7 @@ from gateway.auth import add_key
 from gateway.config import Settings
 from gateway.errors import ProblemError
 from gateway.resilience import BulkheadFull, CircuitBreaker, CircuitOpenError, RetryableError
-from gateway.soap.client import UpstreamRejected
+from gateway.soap.client import UpstreamInvalidResponse, UpstreamRejected
 from tests.integration.conftest import API_TEST_URL as TEST_URL
 from tests.integration.conftest import OPS_KEY, OTHER_SHIPPER_KEY, SHIPPER_KEY
 
@@ -93,8 +93,14 @@ async def test_created_quote_matches_the_contract(ok: tuple[httpx.AsyncClient, S
         (CircuitOpenError("open", retry_after=17.2), 503, "circuit-open", "18"),
         (RetryableError("Server.Busy"), 503, "upstream-busy", "2"),
         (UpstreamRejected("soapenv:Client: origin ZIP not served"), 422, "upstream-rejected", None),
+        (  # an HTML 404 page: OUR endpoint broke, not the shipper's request (PR #6 review)
+            UpstreamInvalidResponse("unparseable response (http 404): ParseError"),
+            502,
+            "upstream-invalid-response",
+            None,
+        ),
     ],
-    ids=["bulkhead_full", "circuit_open", "retries_exhausted", "client_fault"],
+    ids=["bulkhead_full", "circuit_open", "retries_exhausted", "client_fault", "broken_upstream"],
 )
 async def test_failures_are_problem_details(
     error: Exception, status: int, slug: str, retry_after: str | None

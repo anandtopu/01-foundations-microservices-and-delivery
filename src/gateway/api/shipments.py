@@ -14,7 +14,7 @@ import base64
 import binascii
 import json
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Path, Query, Request
@@ -30,12 +30,19 @@ router = APIRouter()
 SHIPMENT_ID = r"^[A-Za-z0-9][A-Za-z0-9-]*$"  # contract ShipmentId
 # RFC 3339 date-time, as the contract says (format: date-time). Pydantic's lax datetime parsing also
 # accepts "0.5" or "1700000000" as Unix timestamps, which Schemathesis caught in M8.
-RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$")
+RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})")
 
 
 def rfc3339(value: object) -> object:
-    if not (isinstance(value, str) and RFC3339.match(value)):
+    if not (isinstance(value, str) and RFC3339.fullmatch(value)):
         raise ValueError("must be an RFC 3339 date-time with an offset, e.g. 2026-09-24T09:15:00Z")
+    # Two RFC 3339 values Python's datetime cannot hold (PR #6 review): a leap second (:60) is read
+    # as the last microsecond of that minute, and year 0000 as the earliest representable instant.
+    # Both mean the same thing for "updated since": nothing is lost.
+    if value[17:19] == "60":
+        value = value[:17] + "59.999999" + value[19:].lstrip("0123456789.")
+    if value.startswith("0000-"):
+        value = "0001-01-01T00:00:00" + value[19:].lstrip("0123456789.")
     return value
 
 
@@ -70,6 +77,10 @@ def decode_cursor(cursor: str, since: str | None) -> tuple[datetime, str]:
         at, shipment_id = blob["u"], blob["i"]
         if not (isinstance(at, str) and isinstance(shipment_id, str)):
             raise ValueError("wrong types")
+        # A str is not enough: "a\u0000b" reached Postgres (DataError) and "\ud800" psycopg's
+        # encoder (UnicodeEncodeError), both 500s (PR #6 review). It must be a real shipment ID.
+        if len(shipment_id) > 32 or not re.fullmatch(SHIPMENT_ID, shipment_id):
+            raise ValueError("not a shipment ID")
         parsed = datetime.fromisoformat(at)
         if parsed.tzinfo is None:
             raise ValueError("naive timestamp")
@@ -88,7 +99,8 @@ async def list_shipments(
     cursor: Annotated[str | None, Query(min_length=1, max_length=512)] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> dict[str, object]:
-    since = updated_since.isoformat() if updated_since else None
+    # Bound to the INSTANT, not the spelling: ...09:15:00Z and ...11:15:00+02:00 are one filter.
+    since = updated_since.astimezone(UTC).isoformat() if updated_since else None
     after = decode_cursor(cursor, since) if cursor else (None, None)
     pool: AsyncConnectionPool = request.app.state.db
     async with pool.connection() as conn:

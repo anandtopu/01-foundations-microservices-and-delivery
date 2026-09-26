@@ -116,6 +116,7 @@ load-quotes:  ## (M5) 50-VU k6 burst on POST /v1/rate-quotes (needs api-local); 
 
 image: base-images  ## (M8) Build meridian-gateway (one image: API, poller, dispatcher, migrations) and show its size
 	$(COMPOSE) build gateway-api
+	docker tag meridian-gateway:latest meridian-gateway:$$(git rev-parse --short HEAD)  # for rollback (spec section 6)
 	docker image ls meridian-gateway
 
 migrate:  ## (M8) Apply additive migrations

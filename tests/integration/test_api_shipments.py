@@ -80,8 +80,11 @@ async def test_updated_since_filters_and_binds_the_cursor(client: httpx.AsyncCli
         {"u": "2026-09-24T09:15:00+00:00", "i": 5, "f": None},
         {"u": "2026-09-24T09:15:00", "i": "SHP001", "f": None},
         [1, 2],
+        {"u": "2026-09-24T09:15:00+00:00", "i": "a\u0000b", "f": None},  # was a 500 (DataError)
+        {"u": "2026-09-24T09:15:00+00:00", "i": "\ud800", "f": None},  # was a 500 (encoder)
+        {"u": "2026-09-24T09:15:00+00:00", "i": "A" * 33, "f": None},
     ],
-    ids=["bad_date", "int_id", "naive", "list"],
+    ids=["bad_date", "int_id", "naive", "list", "nul_id", "surrogate_id", "long_id"],
 )
 async def test_tampered_cursors_are_400(client: httpx.AsyncClient, blob: object) -> None:
     cursor = base64.urlsafe_b64encode(json.dumps(blob).encode()).decode().rstrip("=")
@@ -183,3 +186,23 @@ async def test_unknown_query_parameters_are_422(client: httpx.AsyncClient, path:
     r = await client.get(path, headers=ACME)
     assert (r.status_code, r.json()["type"]) == (422, TYPE + "validation-failed")
     assert r.json()["errors"][0]["message"] == "Unknown query parameter"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2016-12-31T23:59:60Z",  # a leap second: valid RFC 3339, was a 422
+        "0000-01-01T00:00:00Z",  # year 0000: valid RFC 3339, was a 422 ("year 0 is out of range")
+        "2026-09-24t09:15:00z",  # lowercase t and z are allowed
+        "2026-09-24T09:15:00.123456789+05:30",
+    ],
+)
+async def test_rfc3339_edge_values_are_accepted(client: httpx.AsyncClient, value: str) -> None:
+    r = await client.get("/v1/shipments", params={"updated_since": value}, headers=ACME)
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.parametrize("value", ["2026-09-24 09:15:00Z", "2026-09-24T09:15:00Zjunk"])
+async def test_not_rfc3339_is_422(client: httpx.AsyncClient, value: str) -> None:
+    r = await client.get("/v1/shipments", params={"updated_since": value}, headers=ACME)
+    assert r.status_code == 422

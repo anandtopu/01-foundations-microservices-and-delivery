@@ -25,3 +25,6 @@ load/results/
 
 # runtime state (SFTP drop directory, generated files)
 var/
+
+# Schemathesis run cache (rewritten by every gate run)
+.schemathesis/

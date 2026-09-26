@@ -24,7 +24,7 @@ from psycopg import AsyncConnection
 from psycopg_pool import AsyncConnectionPool
 
 from gateway.config import get_settings
-from gateway.errors import ProblemError
+from gateway.errors import ProblemError, reject_unknown_query
 
 Scope = Literal["shipper", "ops"]
 
@@ -70,6 +70,7 @@ async def principal(
     now = time.monotonic()
     cached = _cache.get(digest)
     if cached is not None and cached[0] > now:
+        reject_unknown_query(request)
         return cached[1]
     pool: AsyncConnectionPool = request.app.state.db
     async with pool.connection() as conn:
@@ -85,6 +86,7 @@ async def principal(
     if len(_cache) >= CACHE_MAX:
         _cache.clear()  # crude but bounded; a real LRU is not worth it at this scale
     _cache[digest] = (now + CACHE_TTL_S, who)
+    reject_unknown_query(request)  # after auth: 401 before any 422 (PR #6 review)
     return who
 
 

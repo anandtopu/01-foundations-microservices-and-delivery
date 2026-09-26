@@ -16,7 +16,14 @@ from pydantic import ValidationError
 from gateway.api.rate_quotes import RateQuoteRequest
 from gateway.resilience import RetryableError
 from gateway.soap import client as soap_client
-from gateway.soap.client import RQ_NS, UpstreamRejected, get_rate_quote, render_xml, xsd_decimal
+from gateway.soap.client import (
+    RQ_NS,
+    UpstreamInvalidResponse,
+    UpstreamRejected,
+    get_rate_quote,
+    render_xml,
+    xsd_decimal,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 QUOTE = RateQuoteRequest(
@@ -181,7 +188,7 @@ async def test_response_without_result_is_rejected() -> None:
         "<soapenv:Body/></soapenv:Envelope>"
     )
     async with replay(httpx.Response(200, text=empty)) as client:
-        with pytest.raises(UpstreamRejected, match=r"no GetRateQuoteResult \(http 200\)"):
+        with pytest.raises(UpstreamInvalidResponse, match=r"no GetRateQuoteResult \(http 200\)"):
             await get_rate_quote(client, QUOTE)
 
 
@@ -212,7 +219,7 @@ BILLION_LAUGHS = b"""<?xml version="1.0"?>
 )
 async def test_hostile_or_malformed_responses_are_rejected(body: bytes, kind: str) -> None:
     async with replay(httpx.Response(200, content=body)) as client:
-        with pytest.raises(UpstreamRejected, match=kind):
+        with pytest.raises(UpstreamInvalidResponse, match=kind):
             await get_rate_quote(client, QUOTE)
 
 
@@ -269,15 +276,34 @@ async def test_slow_drip_response_hits_the_total_deadline(monkeypatch: pytest.Mo
         (
             500,
             FAULT.format(code="<faultcode>evil:NotServer.Busy</faultcode>"),
-            UpstreamRejected,
+            UpstreamInvalidResponse,
             "NotServer",
         ),
-        (400, "<html><body>Bad<br></body></html>", UpstreamRejected, "http 400"),
-        (200, '<?xml version="1.0" encoding="bogus-xyz"?><a/>', UpstreamRejected, "LookupError"),
+        (400, "<html><body>Bad<br></body></html>", UpstreamInvalidResponse, "http 400"),
+        (404, "<html><body>Not Found</body></html>", UpstreamInvalidResponse, "http 404"),
+        (
+            200,
+            '<?xml version="1.0" encoding="bogus-xyz"?><a/>',
+            UpstreamInvalidResponse,
+            "LookupError",
+        ),
+        (
+            500,
+            FAULT.format(code="<faultcode>soapenv:Client</faultcode>"),
+            UpstreamRejected,
+            "Client",
+        ),
+        (
+            500,
+            FAULT.format(code="<faultcode>soapenv:VersionMismatch</faultcode>"),
+            UpstreamInvalidResponse,
+            "VersionMismatch",
+        ),
     ],
     ids=[
         "html500", "xml500_no_fault", "429", "generic_server_fault", "qualified_busy",
-        "spoofed_busy", "html400", "bogus_encoding",
+        "spoofed_busy", "html400", "html404_broken_endpoint", "bogus_encoding", "client_fault",
+        "version_mismatch",
     ],
 )  # fmt: skip
 async def test_classification_the_breaker_can_rely_on(
@@ -301,7 +327,7 @@ async def test_unqualified_result_child_does_not_crash() -> None:
 async def test_oversize_response_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(soap_client, "MAX_RESPONSE_BYTES", 100)
     async with replay(httpx.Response(200, content=b"<a>" + b"x" * 500 + b"</a>")) as client:
-        with pytest.raises(UpstreamRejected, match="larger than 100 bytes"):
+        with pytest.raises(UpstreamInvalidResponse, match="larger than 100 bytes"):
             await get_rate_quote(client, QUOTE)
 
 

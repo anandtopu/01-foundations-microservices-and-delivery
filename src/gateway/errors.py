@@ -159,10 +159,14 @@ def declared_query(dependant: Dependant) -> set[str]:
     return names
 
 
-async def reject_unknown_query(request: Request) -> None:
-    """App-wide dependency: a query parameter the route does not declare is a 422, like an unknown
-    body field (extra="forbid"). Otherwise `?updatedSince=...` (a typo) is silently ignored and
-    the shipper gets EVERY shipment back instead of an error (found by Schemathesis, M8)."""
+def reject_unknown_query(request: Request) -> None:
+    """A query parameter the route does not declare is a 422, like an unknown body field
+    (extra="forbid"). Otherwise `?updatedSince=...` (a typo) is silently ignored and the shipper
+    gets EVERY shipment back instead of an error (found by Schemathesis, M8).
+
+    Called by the auth dependency AFTER the key is checked, so an anonymous caller gets 401 first
+    (no pre-auth oracle for which parameters exist), and the unauthenticated probes (/healthz,
+    /readyz) never refuse a load balancer's cache-buster query (PR #6 review)."""
     route = request.scope.get("route")
     if not isinstance(route, APIRoute):
         return

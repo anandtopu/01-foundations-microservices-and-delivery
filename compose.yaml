@@ -79,7 +79,7 @@ services:
     build:
       context: .
       secrets: [build_ca]
-    image: meridian-gateway:latest
+    image: meridian-gateway:${GATEWAY_TAG:-latest}  # spec section 6: roll back with GATEWAY_TAG=<older sha>
     environment: &gateway-env
       DATABASE_URL: postgresql://${POSTGRES_USER:-gateway}:${POSTGRES_PASSWORD:-gateway}@postgres:5432/${POSTGRES_DB:-gateway}
       SOAP_BASE_URL: http://soap-mock:8080
@@ -109,7 +109,7 @@ services:
       restart: unless-stopped
 
   sftp-poller:
-    image: meridian-gateway:latest
+    image: meridian-gateway:${GATEWAY_TAG:-latest}
     command: ["python", "-m", "gateway.ingest.poller"]
     environment:
       <<: *gateway-env
@@ -123,7 +123,7 @@ services:
     <<: *hardening
 
   webhook-dispatcher:
-    image: meridian-gateway:latest
+    image: meridian-gateway:${GATEWAY_TAG:-latest}
     command: ["python", "-m", "gateway.webhooks.dispatcher"]
     environment: *gateway-env
     secrets: [webhook_ca]

@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import Depends, FastAPI
+from fastapi import FastAPI
 
 from gateway import errors
 from gateway.api import dead_letters, health, rate_quotes, shipments, webhooks
@@ -41,7 +41,6 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
         title="Meridian Legacy Integration Gateway",
         version="0.1.0",
         lifespan=lifespan,
-        dependencies=[Depends(errors.reject_unknown_query)],  # unknown query params: 422 (M8)
         # The design-first contract is contracts/openapi.yaml (ADR-P01-4). FastAPI's generated
         # schema differs from it, so do not publish one at all (PR #3 review).
         docs_url=None,
@@ -49,6 +48,7 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
         openapi_url=None,
     )
     app.state.cfg = cfg
+    app.state.sftp_probe = health.SftpProbe()  # one cached SFTP probe per process
     errors.install(app)
     app.include_router(health.router)
     app.include_router(shipments.router)
