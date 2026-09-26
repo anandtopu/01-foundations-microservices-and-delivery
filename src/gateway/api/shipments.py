@@ -13,12 +13,13 @@ updated while you page through moves to the end and is seen again: that is the p
 import base64
 import binascii
 import json
+import re
 from datetime import datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Path, Query, Request
 from psycopg_pool import AsyncConnectionPool
-from pydantic import AwareDatetime
+from pydantic import AwareDatetime, BeforeValidator
 
 from gateway.auth import Principal, shipper_principal
 from gateway.errors import ProblemError
@@ -27,6 +28,18 @@ Caller = Annotated[Principal, Depends(shipper_principal)]
 router = APIRouter()
 
 SHIPMENT_ID = r"^[A-Za-z0-9][A-Za-z0-9-]*$"  # contract ShipmentId
+# RFC 3339 date-time, as the contract says (format: date-time). Pydantic's lax datetime parsing also
+# accepts "0.5" or "1700000000" as Unix timestamps, which Schemathesis caught in M8.
+RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$")
+
+
+def rfc3339(value: object) -> object:
+    if not (isinstance(value, str) and RFC3339.match(value)):
+        raise ValueError("must be an RFC 3339 date-time with an offset, e.g. 2026-09-24T09:15:00Z")
+    return value
+
+
+UpdatedSince = Annotated[AwareDatetime | None, BeforeValidator(rfc3339)]
 COLUMNS = "shipment_id, order_no, status, ship_date, weight_lb, updated_at"
 
 
@@ -71,7 +84,7 @@ def decode_cursor(cursor: str, since: str | None) -> tuple[datetime, str]:
 async def list_shipments(
     request: Request,
     who: Caller,
-    updated_since: AwareDatetime | None = None,
+    updated_since: UpdatedSince = None,
     cursor: Annotated[str | None, Query(min_length=1, max_length=512)] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> dict[str, object]:

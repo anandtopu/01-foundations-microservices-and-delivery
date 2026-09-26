@@ -91,7 +91,15 @@ async def test_tampered_cursors_are_400(client: httpx.AsyncClient, blob: object)
 
 @pytest.mark.parametrize(
     "query",
-    ["limit=0", "limit=201", "updated_since=yesterday", "updated_since=2026-09-24T09:15:00"],
+    [
+        "limit=0",
+        "limit=201",
+        "updated_since=yesterday",
+        "updated_since=2026-09-24T09:15:00",  # no offset
+        "updated_since=0.5",  # lax pydantic read this as a Unix timestamp (Schemathesis, M8)
+        "updated_since=1727170500",
+        "updated_since=2026-09-24",  # a date, not a date-time
+    ],
 )
 async def test_bad_parameters_are_422(client: httpx.AsyncClient, query: str) -> None:
     r = await client.get(f"/v1/shipments?{query}", headers=ACME)

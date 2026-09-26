@@ -4,7 +4,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 COMPOSE ?= docker compose
 
-.PHONY: help setup sync lint fmt typecheck test cov check contract-lint keys certs base-images mocks pin-hostkey migrate migrate-local dev-keys poll-local poll-once api-local dispatch-local load-quotes up down logs schemathesis audit reset drop
+.PHONY: help setup sync lint fmt typecheck test cov check contract-lint keys certs base-images mocks pin-hostkey image migrate migrate-local dev-keys poll-local poll-once api-local dispatch-local load-quotes up down logs schemathesis audit reset drop
 
 help:  ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-15s %s\n", $$1, $$2}'
@@ -46,7 +46,7 @@ keys:  ## (M2) Generate the gateway SFTP key into secrets/ (skips if present)
 # Docker Hub allows 100 anonymous pulls/h per egress IP, and the cloud VM shares its IP, so we hit 429.
 # mirror.gcr.io is Google's read-through cache of Docker Hub: same image digests, no Hub quota. We pull only
 # what is missing and tag it under the Docker Hub name, so Dockerfiles and compose.yaml stay unchanged.
-BASE_IMAGES ?= library/postgres:18 library/debian:trixie-slim library/python:3.14-slim docker/dockerfile:1
+BASE_IMAGES ?= library/postgres:18 library/debian:trixie-slim library/python:3.14-slim library/python:3.14-alpine docker/dockerfile:1
 IMAGE_MIRROR ?= mirror.gcr.io
 
 base-images:  ## (M2) Pre-pull missing base images via mirror.gcr.io (avoids Docker Hub 429s)
@@ -114,11 +114,15 @@ dispatch-local:  ## (M7) Run the webhook dispatcher on the host (demo: WEBHOOK_M
 load-quotes:  ## (M5) 50-VU k6 burst on POST /v1/rate-quotes (needs api-local); then check /__stats
 	k6 run --no-usage-report load/quotes.js
 
+image: base-images  ## (M8) Build meridian-gateway (one image: API, poller, dispatcher, migrations) and show its size
+	$(COMPOSE) build gateway-api
+	docker image ls meridian-gateway
+
 migrate:  ## (M8) Apply additive migrations
 	$(COMPOSE) run --rm gateway-api python -m gateway.migrate
 
-up:  ## (M8) Start the API and both workers
-	$(COMPOSE) up -d gateway-api sftp-poller webhook-dispatcher
+up:  ## (M8) Start the API and both workers (after make image and make migrate)
+	$(COMPOSE) up -d --no-build gateway-api sftp-poller webhook-dispatcher
 
 down:  ## Stop this project's containers (keeps volumes)
 	$(COMPOSE) down --remove-orphans
