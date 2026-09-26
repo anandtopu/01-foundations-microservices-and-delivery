@@ -4,7 +4,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 COMPOSE ?= docker compose
 
-.PHONY: help setup sync lint fmt typecheck test cov check contract-lint keys base-images mocks pin-hostkey migrate migrate-local dev-keys poll-local poll-once api-local load-quotes up down logs schemathesis audit reset drop
+.PHONY: help setup sync lint fmt typecheck test cov check contract-lint keys certs base-images mocks pin-hostkey migrate migrate-local dev-keys poll-local poll-once api-local dispatch-local load-quotes up down logs schemathesis audit reset drop
 
 help:  ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-15s %s\n", $$1, $$2}'
@@ -54,7 +54,24 @@ base-images:  ## (M2) Pre-pull missing base images via mirror.gcr.io (avoids Doc
 	  else docker pull -q "$(IMAGE_MIRROR)/$$i" && docker tag "$(IMAGE_MIRROR)/$$i" "$$n" && echo "pulled $$n via $(IMAGE_MIRROR)"; fi; \
 	done
 
-mocks: base-images  ## (M2) Start Postgres and the legacy stand-ins
+certs:  ## (M7) Lab CA + webhook-sink TLS cert in secrets/ (gitignored); only the dispatcher trusts the CA
+	@mkdir -p secrets/sink-tls && chmod 700 secrets
+	@test -f secrets/webhook-ca.key || openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+	  -days 30 -subj "/CN=Meridian lab webhook CA" -addext "keyUsage=critical,keyCertSign,cRLSign" \
+	  -keyout secrets/webhook-ca.key -out secrets/webhook-ca.crt 2>/dev/null
+	@test -f secrets/sink-tls/tls.key || { \
+	  printf 'subjectAltName=DNS:webhook-sink,DNS:localhost,IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n' > secrets/sink-tls/ext.cnf && \
+	  openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=webhook-sink" \
+	    -keyout secrets/sink-tls/tls.key -out secrets/sink-tls/tls.csr 2>/dev/null && \
+	  openssl x509 -req -in secrets/sink-tls/tls.csr -CA secrets/webhook-ca.crt -CAkey secrets/webhook-ca.key \
+	    -CAcreateserial -days 30 -extfile secrets/sink-tls/ext.cnf -out secrets/sink-tls/tls.crt 2>/dev/null && \
+	  rm -f secrets/sink-tls/tls.csr secrets/sink-tls/ext.cnf; }
+	@cp secrets/webhook-ca.crt secrets/sink-tls/ca.crt
+	@chown -R 10001:10001 secrets/sink-tls 2>/dev/null || true  # the sink runs as uid 10001
+	@chmod 600 secrets/sink-tls/tls.key
+	@openssl verify -CAfile secrets/webhook-ca.crt secrets/sink-tls/tls.crt
+
+mocks: base-images certs  ## (M2) Start Postgres and the legacy stand-ins
 	$(COMPOSE) up -d --build postgres sftp soap-mock webhook-sink
 
 pin-hostkey:  ## (M2) Pin the SFTP host key under the name the workers use ("sftp")
@@ -83,8 +100,15 @@ poll-local:  ## (M3) Run the sftp-poller on the host, every 5 s (demo interval);
 poll-once:  ## (M3) One sftp-poller cycle on the host, then exit
 	env $(HOST_ENV) uv run python -m gateway.ingest.poller --once
 
+# Lab only: the local sink resolves to 127.0.0.1, which the SSRF guard refuses. This exact-name
+# allowance (and the lab CA) exist only in these host targets, never in an image or production.
+LAB_WEBHOOKS = WEBHOOK_DEV_ALLOW_HOSTS=localhost WEBHOOK_CA_BUNDLE=secrets/webhook-ca.crt
+
 api-local:  ## (M5) Run the gateway API on the host, :8000, against the mocks; Ctrl-C to stop
-	env $(HOST_ENV) SOAP_BASE_URL=http://localhost:8080 uv run uvicorn gateway.app:app --port 8000 --no-server-header
+	env $(HOST_ENV) $(LAB_WEBHOOKS) SOAP_BASE_URL=http://localhost:8080 uv run uvicorn gateway.app:app --port 8000 --no-server-header
+
+dispatch-local:  ## (M7) Run the webhook dispatcher on the host (demo: WEBHOOK_MAX_AGE=120s make dispatch-local); Ctrl-C to stop
+	env $(HOST_ENV) $(LAB_WEBHOOKS) uv run python -m gateway.webhooks.dispatcher
 
 load-quotes:  ## (M5) 50-VU k6 burst on POST /v1/rate-quotes (needs api-local); then check /__stats
 	k6 run --no-usage-report load/quotes.js

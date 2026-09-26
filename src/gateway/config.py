@@ -36,6 +36,30 @@ class Settings(BaseSettings):
     breaker_failure_threshold: int = Field(default=5, ge=1)
     breaker_reset_after_s: float = Field(default=30.0, gt=0)
 
+    # --- Webhooks (M7) ---
+    # Retry horizon before dead-lettering: "72h" in production, "120s" for the M7 demo.
+    webhook_max_age: str = Field(default="72h", pattern=r"^[0-9]+[smhd]$")
+    webhook_timeout_s: float = Field(default=5.0, gt=0)  # total per attempt (spec: 5 s)
+    webhook_base_delay_s: float = Field(default=30.0, gt=0)  # full jitter from 30 s...
+    webhook_max_delay_s: float = Field(default=6 * 3600, gt=0)  # ...doubling to a 6 h cap
+    webhook_poll_interval_s: float = Field(default=1.0, gt=0)
+    webhook_batch_size: int = Field(default=50, ge=1)
+    # Lab only: exact hostnames that skip the SSRF address check (the local sink); never in prod.
+    webhook_dev_allow_hosts: str = ""
+    # Lab only: CA bundle the DISPATCHER trusts for the sink's self-signed certificate.
+    webhook_ca_bundle: Path | None = None
+
+    @property
+    def webhook_max_age_s(self) -> float:
+        n, unit = int(self.webhook_max_age[:-1]), self.webhook_max_age[-1]
+        return float(n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit])
+
+    @property
+    def dev_allow_hosts(self) -> frozenset[str]:
+        return frozenset(
+            h.strip().lower() for h in self.webhook_dev_allow_hosts.split(",") if h.strip()
+        )
+
     # --- Ingest ---
     ingest_batch_size: int = Field(default=1000, ge=1)
     migrations_dir: Path = Path("migrations")

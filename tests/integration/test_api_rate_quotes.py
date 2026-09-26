@@ -6,61 +6,35 @@ these tests use a throwaway, migrated database (gateway_api_test). Needs `make m
 
 import asyncio
 import hashlib
-import socket
 from collections.abc import AsyncIterator
-from pathlib import Path
 
 import httpx
 import pytest
-from psycopg import AsyncConnection
 from psycopg_pool import AsyncConnectionPool
 
 from gateway.app import create_app
-from gateway.auth import add_key, forget_cached_keys
+from gateway.auth import add_key
 from gateway.config import Settings
-from gateway.db import make_pool
 from gateway.errors import ProblemError
-from gateway.migrate import load, migrate
 from gateway.resilience import BulkheadFull, CircuitBreaker, CircuitOpenError, RetryableError
 from gateway.soap.client import UpstreamRejected
+from tests.integration.conftest import API_TEST_URL as TEST_URL
+from tests.integration.conftest import OPS_KEY, OTHER_SHIPPER_KEY, SHIPPER_KEY
 
 BODY = {"origin_zip": "30301", "dest_zip": "60601", "weight_lb": 1200, "service_level": "FTL"}
-ADMIN_URL = "postgresql://gateway:gateway@localhost:5432/gateway"
-TEST_URL = "postgresql://gateway:gateway@localhost:5432/gateway_api_test"
-SHIPPER_KEY, OTHER_SHIPPER_KEY, OPS_KEY = "test-acme-key", "test-bolt-key", "test-ops-key"
+
 KEY = {"X-API-Key": SHIPPER_KEY, "Idempotency-Key": "test-key-0001-aaaa"}
 
 pytestmark = pytest.mark.integration
 POOL: AsyncConnectionPool | None = None
-_migrated = False
 
 
 @pytest.fixture(autouse=True)
-async def database() -> AsyncIterator[AsyncConnectionPool]:
-    """A migrated gateway_api_test database (created once per run), emptied before every test."""
-    global POOL, _migrated
-    with socket.socket() as s:
-        s.settimeout(1)
-        if s.connect_ex(("127.0.0.1", 5432)) != 0:
-            pytest.skip("postgres not running (make mocks)")
-    if not _migrated:
-        async with await AsyncConnection.connect(ADMIN_URL, autocommit=True) as admin:
-            await admin.execute("DROP DATABASE IF EXISTS gateway_api_test WITH (FORCE)")
-            await admin.execute("CREATE DATABASE gateway_api_test")
-        await migrate(TEST_URL, load(Path(__file__).parents[2] / "migrations"))
-        await add_key(TEST_URL, SHIPPER_KEY, "ACME", "shipper", "test")
-        await add_key(TEST_URL, OTHER_SHIPPER_KEY, "BOLT", "shipper", "test")
-        await add_key(TEST_URL, OPS_KEY, "meridian-ops", "ops", "test")
-        _migrated = True
-    async with await AsyncConnection.connect(TEST_URL, autocommit=True) as conn:
-        await conn.execute("TRUNCATE idempotency_keys, rate_quotes")
-    forget_cached_keys()  # each test sees the database's current keys
-    POOL = make_pool(TEST_URL)
-    await POOL.open(wait=True)
-    try:
-        yield POOL
-    finally:
-        await POOL.close()
+async def database(api_pool: AsyncConnectionPool) -> AsyncIterator[AsyncConnectionPool]:
+    """The shared gateway_api_test database (conftest), exposed to api() as POOL."""
+    global POOL
+    POOL = api_pool
+    yield api_pool
 
 
 RESULT = {"QuoteRef": "MRQ-1", "TotalCharge": "974.56", "Currency": "USD", "TransitDays": "5"}
@@ -721,3 +695,29 @@ async def test_revocation_takes_effect_within_the_cache_ttl(
         assert (await client.get(unknown, headers=headers)).status_code == 404  # still cached
         clock[0] += auth.CACHE_TTL_S + 0.1
         assert (await client.get(unknown, headers=headers)).status_code == 401  # expired: gone
+
+
+async def test_a_stored_quote_emits_one_rate_quote_completed_event(
+    ok: tuple[httpx.AsyncClient, Stub],
+) -> None:
+    """M7 outbox (difference 43): the event rides in the quote's own transaction, once; the
+    idempotent replay of the same key emits nothing more (PR #5 review: no test covered it)."""
+    client, _ = ok
+    assert POOL is not None
+    async with POOL.connection() as conn:
+        await conn.execute(
+            """INSERT INTO webhook_subscriptions
+                   (subscription_id, client_id, url, event_types, secret)
+               VALUES (gen_random_uuid(), 'ACME', 'https://93.184.216.34/h',
+                       '{rate_quote.completed}', 'whsec_dGVzdA==')"""
+        )
+    first = await client.post("/v1/rate-quotes", json=BODY, headers=KEY)
+    replay = await client.post("/v1/rate-quotes", json=BODY, headers=KEY)
+    assert (first.status_code, replay.headers["Idempotent-Replayed"]) == (201, "true")
+    async with POOL.connection() as conn:
+        cur = await conn.execute("SELECT event_type, payload FROM webhook_deliveries")
+        rows = await cur.fetchall()
+    assert len(rows) == 1
+    event_type, payload = rows[0]
+    assert event_type == "rate_quote.completed"
+    assert payload["data"]["quote_id"] == first.json()["quote_id"]

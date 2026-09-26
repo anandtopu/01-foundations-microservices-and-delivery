@@ -63,8 +63,12 @@ services:
       PORT: "9000"
     ports:
       - "9000:9000"
+    volumes:
+      # M7: HTTPS only. The lab CA and this cert come from `make certs` (gitignored secrets/); the
+      # image serves TLS whenever /certs/tls.crt exists. Only the dispatcher trusts the lab CA.
+      - ./secrets/sink-tls:/certs:ro
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/__health', timeout=2)"]
+      test: ["CMD", "python", "-c", "import ssl, urllib.request; urllib.request.urlopen('https://localhost:9000/__health', timeout=2, context=ssl.create_default_context(cafile='/certs/ca.crt'))"]
       interval: 3s
       timeout: 3s
       retries: 20

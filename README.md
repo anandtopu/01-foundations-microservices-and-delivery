@@ -175,6 +175,52 @@ Fire 20 concurrent identical requests with one key (the M6 gate: expect `{'calls
 uv run python load/idempotency_burst.py
 ```
 
+Webhooks (M7). `make mocks` already ran `make certs`: a lab CA and the sink's TLS certificate in `secrets/` (gitignored). Only the dispatcher trusts that CA. Apply the webhook migration if you haven't:
+
+```bash
+make migrate-local
+```
+
+Run the webhook dispatcher on the host, in its own terminal (it drains the outbox every second):
+
+```bash
+make dispatch-local
+```
+
+For the dead-letter demo, run it with a 2-minute max age instead of 72 h:
+
+```bash
+WEBHOOK_MAX_AGE=120s make dispatch-local
+```
+
+Subscribe ACME's webhook sink to shipment events. The response carries the signing secret **once**; keep it:
+
+```bash
+curl -s -X POST localhost:8000/v1/webhook-subscriptions -H 'X-API-Key: dev-shipper-key' -H 'Content-Type: application/json' -d '{"url":"https://localhost:9000/webhooks/acme","event_types":["shipment.created","shipment.status_changed"]}'
+```
+
+Give the sink that secret, so it can verify signatures (replace `whsec_...` with the value from the previous response):
+
+```bash
+curl -s --cacert secrets/webhook-ca.crt -X POST https://localhost:9000/__secrets -H 'Content-Type: application/json' -d '{"secrets":["whsec_..."]}'
+```
+
+Drop and ingest a CSV (`make drop F=...`, with `make poll-local` running), then count the valid signatures the sink saw (the M7 gate):
+
+```bash
+docker compose logs webhook-sink --since 15m | grep -c "signature=valid"
+```
+
+List the dead letters and replay one as ops (a webhook replay answers `202 queued`; it is resolved when delivered):
+
+```bash
+curl -s 'localhost:8000/v1/dead-letters?kind=webhook' -H 'X-API-Key: dev-ops-key'
+```
+
+```bash
+curl -s -X POST "localhost:8000/v1/dead-letters/<dead_letter_id>:replay" -H 'X-API-Key: dev-ops-key'
+```
+
 List every other target:
 
 ```bash
