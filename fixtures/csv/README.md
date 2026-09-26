@@ -6,6 +6,7 @@ Byte-exact golden files: **Windows-1252**, **CRLF**, `"`-delimited and space-pad
 | File | Rows | Expected after ingest (M3 gate) |
 |---|---|---|
 | `SHPSTS_20260924_0915.csv` | header + 5 | 3 shipments; 2 dead letters: `unknown status code 'Q'` (line 5) and `blank key field` (line 6) |
+| `SHPSTS_20260925_0730.csv` | header + 4 | 4 shipments, 0 dead letters. The cp1252 golden file: order numbers `CAFÉ-8801`, `PEÑA-8802`, `£REF-8803`, `€QT-8804` (bytes `0xC9`, `0xD1`, `0xA3`, `0x80`). `€` is the byte that proves cp1252, not Latin-1; line 4 has a `C=0` date (`0991231` = 1999-12-31) |
 
 Columns: `SHIPMENT_ID, ORDER_NO, SHIPPER_CODE, STATUS, SHIP_DATE, WEIGHT_LB`.
 `SHIPPER_CODE` is **not** in the spec's `ShipmentRow`. It was added in M1/M2 (decision A) so every row

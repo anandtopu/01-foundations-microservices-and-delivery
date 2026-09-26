@@ -240,3 +240,113 @@ sshd log: `Accepted publickey for gateway … ED25519 SHA256:64hkPe…`, which i
 </details>
 
 ---
+
+## M3 — CSV ingestion with legacy quirks   (2026-09-26, session 3)
+
+**Goal / requirement served:** FR-1 (ingest once `.done` exists; poll every 60 s, 5 s for the demo), FR-2 (valid rows upsert; invalid rows go to `dead_letters` with file, line, raw row and reason), section 9 (every shipment carries its shipper's `client_id`, per decision A), and the groundwork for the M9 chaos row ("restart the poller mid-way through a 20k-row file, then show exactly-once").
+
+**What we built:**
+- `migrations/0001_init.sql`: the `shipments`, `ingested_files` and `dead_letters` tables. Includes the pagination index `(client_id, updated_at, shipment_id)`, a partial unique index so there is one dead letter per (file, line), and `uuidv7()` IDs (built into PG 18).
+- `src/gateway/config.py`: `Settings` (pydantic-settings) for every section 6 variable M3 needs, plus `SFTP_HOST_KEY_ALIAS`.
+- `src/gateway/db.py`: an async pool factory for the API (M5+). The poller uses plain connections.
+- `src/gateway/migrate.py`: `python -m gateway.migrate`. Runs ordered `NNNN_*.sql` files, each in its own transaction with its `schema_migrations` row, under an advisory lock. It refuses to run if an applied file has been edited.
+- `src/gateway/ingest/model.py`: the spec's `ShipmentRow` verbatim, plus marked additions:
+  - `shipper_code` (decision A);
+  - weight stripping, with `ge=0, max_digits=12, decimal_places=2`;
+  - `parse_export()`, a pure function from bytes to `GoodRow` or `DeadRow`, with `FileRejected` for an undecodable file or wrong header.
+- `src/gateway/ingest/poller.py`: the sftp-poller: advisory-lock leader, `.done` trigger, mtime fast path, sha256 dedupe, batch plus checkpoint in one transaction, and `--once`.
+- `fixtures/csv/SHPSTS_20260925_0730.csv`: the cp1252 golden file (`CAFÉ`, `PEÑA`, `£REF`, `€QT`, plus a `C=0` date). `fixtures/csv/generate.py`: a deterministic N-row generator (the M9 20k file).
+- `tests/unit/test_ingest_model.py` (23 tests) and `tests/integration/test_ingest.py` (9 tests, each run against a fresh `gateway_test` database).
+- `Makefile`: `migrate-local`, `poll-once`, `poll-local`. Also `.env.example` updates, README quick start, and ARCHITECTURE (differences 5–8, plus an ingest data-flow diagram).
+
+**How it works:**
+- **Quirks at the boundary:** all IBM i weirdness (padding, CYYMMDD, one-letter statuses, cp1252) is handled by Pydantic `mode="before"` validators in one module with no I/O, so it's unit-testable in milliseconds. Everything downstream sees typed `ShipmentRow`s.
+- **Line numbers are physical lines,** with the header as line 1, because that's what ops opens in an editor. CPYTOIMPF never puts a newline inside a field, so one line is one record.
+- **Two kinds of bad input:** a bad *row* becomes a dead letter and the batch carries on (FR-2). A bad *file* (wrong header, a byte cp1252 doesn't define) is rejected whole, with one dead letter, because no row in it can be trusted.
+- **Dedupe:** the drop is read-only to us, so we can't delete or rename processed files; `ingested_files` is our memory. The authoritative key is (name, size, sha256). The (name, size, mtime) fast path avoids re-downloading every finished file every 60 s.
+- **Exactly-once:** each batch commits its upserts, its dead letters and the file's `last_line` in **one** transaction. A crash rolls back the in-flight batch and its checkpoint together, and the next run resumes after the last committed line.
+- **Idempotent upsert:** `ON CONFLICT … DO UPDATE … WHERE (…) IS DISTINCT FROM EXCLUDED` makes an identical re-delivery a true no-op. `updated_at` (the pagination cursor key) moves only on real change. `RETURNING (xmax = 0)` tells inserts from updates, which M7 will use to emit webhook events.
+- **One active poller:** `pg_try_advisory_lock` per cycle, scoped to the session, so it is released even if the process dies. A second replica is a hot standby, not a double-ingester.
+- **Failure handling:** SFTP down, Postgres down or a host-key mismatch → log, then retry next cycle. Committed batches are safe. The host key is always verified; there is no `known_hosts=None` path.
+
+**Commands run, in order:**
+1. PR #1 (M0–M2) marked ready and merged with a merge commit (`cf84fe1`); `build/p01` fast-forwarded to it. Per your instruction, M3 stops at a PR for your review.
+2. `grep host_key_alias .venv/.../asyncssh/connection.py` + `known_hosts.py`: asyncssh has `host_key_alias`, and with a non-default port it looks up `[sftp]:2222` first, then falls back to `sftp`. So one pin works both on the host and in Compose.
+3. `DATABASE_URL=…localhost… uv run python -m gateway.migrate` → `applied 1 migration(s): 0001_init`; again → `none pending`. `\dt` shows 4 tables; `select uuidv7()` works.
+4. `parse_export()` on the golden file → 3 `GoodRow`, and `DeadRow` for line 5 `status: unknown status code 'Q'` and line 6 `shipment_id: blank key field`.
+5. `ruff` + `mypy --strict` → 2 real findings, fixed (see "What broke" 1).
+6. `poller --once` from the host → `status=done rows_ok=3 rows_dead=2 inserted=3`.
+7. Re-drop scenarios (a), (b), (c) → no duplicates, but an mtime bug (see "What broke" 3).
+8. `pytest tests/unit/test_ingest_model.py` → 23 passed. `pytest tests/integration/test_ingest.py` → 9 passed.
+9. Mutation testing of the integration suite (see "What broke" 4).
+10. `make check` → ruff clean, mypy clean, **81 passed**.
+11. The gate (below), with the poller running in the background every 5 s. Then a Postgres stop/start while it ran, then `kill <pid>` (only the PID we started).
+
+**Verification:** the Done-when gate, with the poller running in the background (`SFTP_POLL_INTERVAL_S=5`) and the file dropped with `make drop`:
+
+```text
+$ docker compose exec postgres psql -U gateway -d gateway -c "select count(*) from shipments; select reason from dead_letters;"
+ count
+-------
+     3
+             reason
+---------------------------------
+ status: unknown status code 'Q'
+ shipment_id: blank key field
+```
+
+| Check | Result |
+|---|---|
+| Sample → 3 shipments, 2 dead letters | ✅ exactly as above |
+| Re-drop of the same file (new mtime) | ✅ `skipped: this content (sha256) was already ingested`; still 3 + 2 |
+| Same bytes, new name | ✅ `inserted=0 updated=0`; `max(updated_at)` unchanged |
+| cp1252 golden (é/ñ/£/€) | ✅ stored as `CAFÉ-8801`, `PEÑA-8802`, `£REF-8803`, `€QT-8804` |
+| 7 shipments after all drops | ✅ `count(*) = count(distinct shipment_id) = 7` |
+| Crash inside batch 3 of a 2,500-row file, then resume | ✅ after the crash: checkpoint 2001, 1,960 rows; after the resume: 2,450 shipments, 50 dead letters, exactly once |
+| Postgres stopped for ~10 s while polling | ✅ `poll failed: OperationalError …` every 5 s, no crash; recovered on its own |
+| Wrong host key | ✅ `HostKeyNotVerifiable` (test) |
+| CSV without `.done` | ✅ ignored (test) |
+
+**What broke and how we fixed it:**
+1. *Static analysis found two real bugs.*
+   - mypy: asyncssh types SFTP names and reads as `str | bytes`. `f"{name}.done"` on bytes would produce `"b'x.csv'.done"` and never match. Fixed by narrowing explicitly (`text()`, plus an `isinstance` check on the read).
+   - ruff ASYNC240: the migrator did blocking file I/O inside the event loop. Loading moved to a sync `load()` that runs before `asyncio.run`.
+   - The `assert` became a `RuntimeError`, because asserts vanish under `python -O`.
+2. *A self-review catch:* the poll loop caught `OSError`, but `psycopg.OperationalError` isn't a subclass of it. A Postgres restart would have **killed** the poller, which is exactly the M9 chaos case. Added it to the handler and proved it with a live Postgres stop.
+3. *The mtime fast path missed forever after a re-drop.*
+   - *Symptom:* `file_id` jumped from 1 to 4.
+   - *Hypothesis:* every `ON CONFLICT` consumes an identity value, so there were two unexpected conflicts.
+   - *Evidence:* with debug logs, the listing showed mtime `…5675` against `…4929` stored, and the file was re-downloaded and re-hashed on every cycle.
+   - *Root cause:* `make drop` rewrote an identical file, giving it a new mtime, but the stored mtime was never refreshed.
+   - *Fix:* `claim_file` became one `INSERT … ON CONFLICT DO UPDATE SET mtime = EXCLUDED.mtime RETURNING …`. Verified that cycle 1 does one hash check and cycle 2 takes the fast path; the regression test asserts the refreshed mtime.
+4. *My crash test was too kind.*
+   - Mutation 1 moved the checkpoint into its own transaction, committed *before* the rows. That is the classic at-most-once bug, and the test still **passed**. The simulation wrapped the batch in an outer transaction, which turned the mutant's early commit into a savepoint that was rolled back too.
+   - *Fix:* `DiesAfterUpsert`, a connection proxy that raises right after the upsert, with no extra transaction. What was committed stays committed, like a real kill.
+   - Mutation 1 now fails with a checkpoint of 2501 against rows up to line 2001, which would have silently lost 500 shipments. Mutation 2 (removing `IS DISTINCT FROM`) fails the "no-op re-drop" test. With the real code, all tests pass.
+   - Lesson (again): a test proves nothing until you have seen it fail for the right reason.
+
+**Known limits (for later milestones or production):**
+- The last writer wins, **including `client_id`**. If a file reassigns a shipment to another shipper, it moves. At Meridian we'd dead-letter an owner change instead of applying it (the security architect's call).
+- File order is by name (the names carry the IBM i timestamp). An *older* file dropped late would overwrite newer statuses. A production fix compares a source timestamp or sequence number, if the IBM i team will add one.
+- Each file is held in memory while it is processed. That's about 1.2 MB for 20k rows, which is fine; a multi-GB export would need streaming.
+
+**Cloud vs real customer environment:** at Meridian the poller reaches the DMZ SFTP host over Direct Connect or a VPN, from an allowlisted egress IP. The key and `known_hosts` come from a secret store, and the fingerprint is confirmed out of band. The IBM i team's `.done` convention is a contract to agree in writing, since they "say no to changes". The dead-letter queue is how their data-quality problems reach them without paging us. Real exports are larger and arrive on their schedule, so batch size and poll interval are tuned against their job's timing. `numeric(12,2)` and the status map come from their field definitions (DDS), not guesses.
+
+**Check yourself:**
+1. Why must the `last_line` checkpoint be updated in the *same* transaction as the batch's upserts? What goes wrong if it commits just before, or just after?
+2. The poller dedupes on (name, size, sha256), yet also looks at mtime. What is each one for, and why is mtime alone not safe as the dedupe key?
+3. Line 5 of a 20k-row file has status `Q`, and the file's header says `SHIPMENT_NO` instead of `SHIPMENT_ID`. What does the gateway do in each case, and why the difference?
+
+<details><summary>answers</summary>
+
+1. The checkpoint describes which rows are in the database, so it has to become visible at the same instant they do. If it commits *before* the rows and the process dies in between, the checkpoint claims lines the database doesn't have: the resume skips them, and they are lost (at-most-once). Mutation 1 proved this: 500 rows vanished. If it commits *after* the rows and the process dies in between, the resume re-applies a batch. The upsert makes shipments harmless to repeat, but dead letters would duplicate without the unique index, and any side effect (M7's outbox events) would fire twice (at-least-once). One transaction gives exactly-once.
+2. sha256 is the identity of the *content*: the same name and size with different bytes is a new export and must be ingested, and identical bytes are a duplicate however they arrived. But computing it requires downloading the file. (name, size, mtime) is a cheap *hint* that lets us skip finished files without a download every 60 s. mtime alone is unsafe because it changes when an identical file is re-copied (our `make drop` bug), and it can stay the same while content changes (clock skew, tools that preserve mtime). So it may only ever *skip work*, never *decide* identity.
+3. Status `Q` is one bad **row**. It becomes a dead letter (line 5, raw row, `status: unknown status code 'Q'`), and the other 19,999 rows are ingested (FR-2: the batch continues). A wrong header means the **file** doesn't match the format we agreed, so every column mapping is suspect. The whole file is rejected (`status = rejected`, one dead letter at line 1), and nothing from it is written. Ingesting it anyway could put order numbers into shipment IDs across 20k rows.
+</details>
+
+**What would break in production here (spec section 12):**
+- **The IBM i job writes `.done` before the CSV is complete** (or the job is rewritten without the trigger). We would ingest a truncated file. The size check only catches a change *during our download*. The contract is the `.done` ordering, and a trailer row with a record count would make it verifiable.
+- **The host key rotates** (the SFTP host is rebuilt). Every cycle fails with `HostKeyNotVerifiable`, and shipments go stale while the API still serves old data. It needs an alert on consecutive poll failures and the out-of-band fingerprint process, never disabling verification.
+- **The drop fills with years of files.** The listing and fast-path queries grow every cycle. Ask Meridian for an archive or retention job on their side; our side can't delete (read-only by design).
+
+---

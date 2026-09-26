@@ -4,7 +4,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 COMPOSE ?= docker compose
 
-.PHONY: help setup sync lint fmt typecheck test cov check contract-lint keys base-images mocks pin-hostkey migrate up down logs schemathesis audit reset drop
+.PHONY: help setup sync lint fmt typecheck test cov check contract-lint keys base-images mocks pin-hostkey migrate migrate-local poll-local poll-once up down logs schemathesis audit reset drop
 
 help:  ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-15s %s\n", $$1, $$2}'
@@ -59,6 +59,21 @@ mocks: base-images  ## (M2) Start Postgres and the legacy stand-ins
 
 pin-hostkey:  ## (M2) Pin the SFTP host key under the name the workers use ("sftp")
 	$(COMPOSE) exec -T sftp sh -c 'echo "sftp $$(cut -d" " -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)"' > secrets/known_hosts
+
+# Until M8 packages the gateway, run it on the host against the published ports. The host key stays
+# pinned under "sftp" (the in-network name); SFTP_HOST_KEY_ALIAS makes the lookup use that entry.
+HOST_ENV = DATABASE_URL=postgresql://gateway:gateway@localhost:5432/gateway \
+	SFTP_HOST=localhost SFTP_PORT=2222 SFTP_HOST_KEY_ALIAS=sftp \
+	SFTP_KEY_PATH=secrets/gateway_ed25519 SFTP_KNOWN_HOSTS=secrets/known_hosts
+
+migrate-local:  ## (M3) Apply migrations from the host to the Compose Postgres
+	env $(HOST_ENV) uv run python -m gateway.migrate
+
+poll-local:  ## (M3) Run the sftp-poller on the host, every 5 s (demo interval); Ctrl-C to stop
+	env $(HOST_ENV) SFTP_POLL_INTERVAL_S=5 uv run python -m gateway.ingest.poller
+
+poll-once:  ## (M3) One sftp-poller cycle on the host, then exit
+	env $(HOST_ENV) uv run python -m gateway.ingest.poller --once
 
 migrate:  ## (M8) Apply additive migrations
 	$(COMPOSE) run --rm gateway-api python -m gateway.migrate

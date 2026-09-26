@@ -44,7 +44,7 @@ One Docker Compose project with 7 services on one bridge network. The trust boun
 | `soap-mock` (FastAPI) | `RateQuoteService` | 8080 | M2 | built (M2) |
 | `webhook-sink` (FastAPI) | A shipper's webhook receiver | 9000 | M2 | built (M2) |
 | `gateway-api` | `meridian-gateway-api` | 8000 | M8 | planned |
-| `sftp-poller` | sftp-poller worker | none | M3/M8 | planned |
+| `sftp-poller` | sftp-poller worker | none | M3/M8 | code built (M3), runs on the host via `make poll-local`; container in M8 |
 | `webhook-dispatcher` | webhook-dispatcher worker | none | M7/M8 | planned |
 
 ## Known differences from the spec (running log)
@@ -55,3 +55,22 @@ One Docker Compose project with 7 services on one bridge network. The trust boun
 | 2 | Container egress: `deb.debian.org` is blocked (403), and container TLS does not trust the session proxy's CA | Cloud network allowlist and proxy; affects image builds only | M0 (found), M2/M8 (handled) |
 | 3 | `deb.debian.org` is reachable as of session 3; Docker Hub returns 429 on the shared egress IP, so `make base-images` pulls base images from `mirror.gcr.io` and retags them | Anonymous Hub quota (100/h per IP) is shared with other tenants | M2 |
 | 4 | The SFTP host key is pinned once, under `sftp`, read from inside the container; the M2 gate uses `-o HostKeyAlias=sftp` instead of `ssh-keyscan -p 2222 localhost` | The spec's gate (M2) and deploy steps (section 6) pin under different names in the same file | M2 |
+| 5 | The CSV has a `SHIPPER_CODE` column, and `ShipmentRow` has a `shipper_code` field that becomes `shipments.client_id` | The spec's row has no owner, so section 9's BOLA filter would be impossible (decision A, M1) | M3 |
+| 6 | `ingested_files` carries a `last_line` checkpoint and a status (`in_progress`, `done`, `rejected`) | The spec says "commit per 1,000-row batch"; a checkpoint that commits with each batch is what makes a restart mid-file exactly-once (M9 chaos row) | M3 |
+| 7 | A file with a bad header or undefined cp1252 bytes is rejected whole (one dead letter, line 1) | No row of a file we cannot decode can be trusted | M3 |
+| 8 | `SFTP_HOST_KEY_ALIAS` setting (asyncssh `host_key_alias`) | Lets the poller run on the host against `localhost:2222` while verifying the single `sftp` pin | M3 |
+
+## Ingest data flow (M3)
+
+```text
+IBM i job ──writes──> X.csv, then X.csv.done  (SFTP drop, read-only to us)
+                               │
+sftp-poller, every 60 s (5 s demo), one active replica (pg_try_advisory_lock)
+  1. list the drop; keep X.csv only if X.csv.done exists
+  2. fast path: (name, size, mtime) of a finished file? -> skip without download
+  3. download; sha256; INSERT ingested_files ... ON CONFLICT (name, size, sha256) -> done? skip
+  4. decode cp1252 -> header check -> ShipmentRow per line (resume after last_line)
+  5. per 1,000 lines, ONE transaction:
+       upsert shipments (no-op if unchanged) + dead_letters (row) + last_line checkpoint
+  6. status = done
+```
