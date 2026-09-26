@@ -151,3 +151,19 @@ Zero errors and zero unexplained warnings. `openapi-spec-validator`: `OK`. `make
 2. `404`. A `403` would confirm the ID exists and belongs to someone else, which leaks information and helps enumeration (BOLA, OWASP API1:2023). The query filters on the caller's `client_id`, so from their point of view the record does not exist.
 3. JSON numbers are usually parsed as IEEE-754 binary floats (JavaScript always does this), and decimals like `0.1` cannot be represented exactly, so money gets rounded and trailing zeros are lost. A string with a decimal pattern keeps the exact value, and clients parse it into a decimal type deliberately.
 </details>
+
+---
+
+## M2 — Local legacy environment   (IN PROGRESS, 2026-09-26, session 2)
+
+*The full section is written when the gate passes. This records the state so a VM reclaim loses nothing.*
+
+**Session 2 start:** the VM was reclaimed and restored between M1 and M2 (`uptime` 0 min, disk intact, processes gone). `cloud-setup.sh` restarted `dockerd` through the new auto-start path (`INFO: docker daemon not running; starting dockerd`), the first live test of that fix.
+
+**Done so far (pushed in `cc7da69`):** the SOAP mock, webhook sink, shared Python mock Dockerfile (proxy CA as a BuildKit secret, verified absent from the image), the SFTP Dockerfile, `sshd_config` and entrypoint, `compose.yaml`, the golden CSV with `SHIPPER_CODE` (decision A), `make drop`, `make keys` (key generated, gitignored). `postgres`, `soap-mock` and `webhook-sink` are up and healthy. `tests/integration/test_mocks.py`: 6/6 passed on 3 consecutive runs.
+
+**Debugged:** `test_above_five_concurrent_is_server_busy` expected peak concurrency 8 for 8 simultaneous calls and got 6. The mock logs showed rejected calls finish in about 1 ms, so they barely overlap each other. The test's model was wrong, not the mock: exceeding the limit always yields a peak of at least 6, which is what the test now asserts (and why "peak ≤ 4" is a sound M5 gate).
+
+**Blocked:**
+1. `docker compose build sftp` → `403 Forbidden` from `deb.debian.org` (trixie, trixie-updates, trixie-security). The host gets the same 403: a network-policy block.
+2. Trying `ubuntu:24.04` as a plan B → Docker Hub `429 Too Many Requests` (anonymous pull rate limit on a shared egress IP).
