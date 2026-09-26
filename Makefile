@@ -4,7 +4,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 COMPOSE ?= docker compose
 
-.PHONY: help setup sync lint fmt typecheck test cov check contract-lint keys mocks pin-hostkey migrate up down logs schemathesis audit reset
+.PHONY: help setup sync lint fmt typecheck test cov check contract-lint keys mocks pin-hostkey migrate up down logs schemathesis audit reset drop
 
 help:  ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-15s %s\n", $$1, $$2}'
@@ -70,3 +70,10 @@ audit:  ## Known-vulnerability scan of the locked dependencies
 reset:  ## DESTRUCTIVE: remove this project's containers AND volumes (asks first)
 	@read -p "Delete this project's volumes (Postgres data, SFTP host keys)? [y/N] " a && [ "$$a" = y ]
 	$(COMPOSE) down -v --remove-orphans
+
+drop:  ## Play the IBM i job: copy F=<csv> into the SFTP drop, THEN write its .done trigger
+	@test -n "$(F)" || { echo "usage: make drop F=fixtures/csv/<file>.csv"; exit 2; }
+	mkdir -p var/sftp-drop
+	cp "$(F)" "var/sftp-drop/$$(basename "$(F)").tmp"
+	mv "var/sftp-drop/$$(basename "$(F)").tmp" "var/sftp-drop/$$(basename "$(F)")"
+	touch "var/sftp-drop/$$(basename "$(F)").done"

@@ -1,0 +1,16 @@
+# mocks/sftp/sshd_config: the spec's M2 config, verbatim, plus lab additions marked below.
+Port 22
+PasswordAuthentication no
+PubkeyAuthentication yes
+Subsystem sftp internal-sftp
+# --- lab addition: host key lives on a volume so rebuilds keep the identity (spec section 12) ---
+HostKey /etc/ssh/ssh_host_ed25519_key
+# --- lab addition: no interactive login methods at all ---
+KbdInteractiveAuthentication no
+PermitRootLogin no
+LogLevel VERBOSE
+Match User gateway
+    ChrootDirectory /srv/sftp
+    ForceCommand internal-sftp -R
+    AllowTcpForwarding no
+    X11Forwarding no

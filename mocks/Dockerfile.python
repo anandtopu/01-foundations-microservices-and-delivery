@@ -1,0 +1,22 @@
+# syntax=docker/dockerfile:1
+# Shared image for the Python mocks (soap, webhook-sink). Build with: --build-arg MOCK=soap
+FROM python:3.14-slim
+
+ARG MOCK
+WORKDIR /app
+COPY ${MOCK}/requirements.txt .
+
+# build_ca is an OPTIONAL BuildKit secret: the CA bundle of a TLS-inspecting egress proxy (e.g. the
+# Claude Code cloud VM). It is mounted only for this RUN step and never stored in a layer. Elsewhere it
+# is empty (/dev/null) and pip uses its normal trust store.
+RUN --mount=type=secret,id=build_ca \
+    if [ -s /run/secrets/build_ca ]; then export PIP_CERT=/run/secrets/build_ca; fi; \
+    pip install --no-cache-dir --disable-pip-version-check -r requirements.txt
+
+COPY ${MOCK}/app.py .
+RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin mock
+USER 10001
+ENV PORT=8080 PYTHONUNBUFFERED=1
+
+# HTTPS when a cert is mounted at /certs (the webhook sink in M7); plain HTTP otherwise.
+CMD ["sh", "-c", "if [ -f /certs/tls.crt ]; then exec uvicorn app:app --host 0.0.0.0 --port \"$PORT\" --ssl-certfile /certs/tls.crt --ssl-keyfile /certs/tls.key; else exec uvicorn app:app --host 0.0.0.0 --port \"$PORT\"; fi"]

@@ -47,6 +47,7 @@ module-name = "gateway"
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = ["-ra", "--strict-markers", "--import-mode=importlib"]
+markers = ["integration: needs the Compose stack running (skips when it is not)"]
 
 [tool.ruff]
 line-length = 100
