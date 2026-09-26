@@ -35,7 +35,7 @@ cov:  ## Tests with branch coverage on the section 7 targets (M9 gate: >= 90%)
 check: lint typecheck test  ## Everything a contributor runs before pushing
 
 contract-lint:  ## (M1) Lint the OpenAPI 3.1 contract
-	npx --yes @redocly/cli lint contracts/openapi.yaml
+	npx --yes @redocly/cli@2.54.3 lint contracts/openapi.yaml
 
 keys:  ## (M2) Generate the gateway SFTP key into secrets/ (skips if present)
 	@mkdir -p secrets && chmod 700 secrets

@@ -1,0 +1,750 @@
+openapi: 3.1.0
+info:
+  title: Meridian Integration Gateway
+  version: 1.0.0
+  summary: REST and webhook façade over Meridian Freight's AS/400 shipment feed and SOAP rate-quote service.
+  description: |
+    Design-first contract (ADR-P01-4). Shippers review this document before code exists, and every build
+    runs conformance tests against it (Schemathesis), so every status code the service can return is listed here.
+
+    **Errors.** Every error body is RFC 9457 Problem Details (`application/problem+json`). The `type` URI is
+    stable and machine-readable; `title` is stable per `type`; `detail` is human-readable and may change.
+
+    **Authentication.** Send your API key in `X-API-Key`. Keys are scoped per shipper: every read is filtered
+    to your own records, and a record that belongs to someone else returns `404`, never `403`. Dead-letter
+    endpoints additionally require a key with the `ops` scope; a shipper key gets `403`.
+
+    **Upstream protection (ADR-P01-1).** Meridian's rate service accepts at most 5 concurrent requests. The
+    gateway allows at most 4 in flight across all shippers. Beyond that, and while the circuit breaker is
+    open, `POST /v1/rate-quotes` fails fast with `503` and a `Retry-After` header (seconds). Honour it, and
+    add jitter to your own retries.
+
+    **Idempotency.** `POST /v1/rate-quotes` requires an `Idempotency-Key`. Retrying with the same key and the
+    same body returns the stored response (with `Idempotent-Replayed: true`) and never calls upstream twice.
+    The same key with a different body returns `422`; the same key while the first request is still running
+    returns `409` with `Retry-After`. Keys are retained for 24 hours.
+
+    **Webhooks.** Deliveries are signed per the Standard Webhooks specification and are at-least-once:
+    deduplicate on the `webhook-id` header. See the `webhooks` section of this document.
+  contact:
+    name: Beacon FDE team (Meridian integration)
+    email: meridian-integration@example.com
+  license:
+    name: Proprietary (composite learning scenario)
+    identifier: LicenseRef-Proprietary
+
+servers:
+  - url: http://localhost:8000
+    description: Local lab (Docker Compose)
+
+security:
+  - apiKey: []
+
+tags:
+  - name: Shipments
+    description: Shipment status sourced from the AS/400 SFTP export (FR-3).
+  - name: Rate quotes
+    description: Idempotent rate quotes proxied to the SOAP RateQuoteService (FR-4).
+  - name: Webhook subscriptions
+    description: Register HTTPS endpoints for signed event notifications (FR-5, FR-6).
+  - name: Dead letters
+    description: Ops-only view and replay of rows and deliveries that could not be processed (FR-7).
+  - name: Health
+    description: Liveness and readiness probes for the platform, not for shippers.
+
+paths:
+  /v1/shipments:
+    get:
+      operationId: listShipments
+      tags: [Shipments]
+      summary: List shipments changed since a point in time
+      description: |
+        Cursor pagination ordered by `(updated_at, shipment_id)`. Pass `next_cursor` from the previous page as
+        `cursor` to continue; a `null` `next_cursor` means you have reached the end. A cursor is opaque and
+        encodes the filter it was issued for, so do not combine it with a different `updated_since`.
+      parameters:
+        - $ref: '#/components/parameters/UpdatedSince'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of shipments
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShipmentPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/shipments/{shipment_id}:
+    get:
+      operationId: getShipment
+      tags: [Shipments]
+      summary: Get one shipment
+      parameters:
+        - name: shipment_id
+          in: path
+          required: true
+          description: The AS/400 shipment number, with padding removed.
+          schema: { $ref: '#/components/schemas/ShipmentId' }
+      responses:
+        '200':
+          description: The shipment
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Shipment' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/rate-quotes:
+    post:
+      operationId: createRateQuote
+      tags: [Rate quotes]
+      summary: Request a rate quote (idempotent)
+      description: |
+        Calls Meridian's SOAP rate service (upstream p99 about 2.8 s) and stores the quote for 15 minutes.
+        Always send an `Idempotency-Key`; retries with the same key and body are safe.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: Unique per logical request, chosen by the client (a UUID works). Retained for 24 hours.
+          schema: { type: string, minLength: 16, maxLength: 128, pattern: '^[\x21-\x7E]+$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RateQuoteRequest' }
+      responses:
+        '201':
+          description: Quote created (or replayed from a previous request with the same key)
+          headers:
+            Location:
+              description: URL of the stored quote.
+              schema: { type: string }
+            Idempotent-Replayed:
+              description: Present and `true` when this response is a replay of an earlier request.
+              schema: { type: string, enum: ['true'] }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RateQuote' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: A request with this `Idempotency-Key` is still in progress. Retry after the delay.
+          headers:
+            Retry-After: { $ref: '#/components/headers/RetryAfter' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422':
+          description: |
+            The body failed validation, or this `Idempotency-Key` was already used with a different body
+            (`type` ends in `/idempotency-key-reused`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502':
+          description: Meridian's rate service rejected the request (SOAP Client fault). Not retryable as-is.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: |
+            Upstream saturated (all 4 slots busy), circuit open, or upstream still busy after bounded retries.
+            Nothing was stored against your `Idempotency-Key`, so retrying with the same key is safe.
+          headers:
+            Retry-After: { $ref: '#/components/headers/RetryAfter' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/rate-quotes/{quote_id}:
+    get:
+      operationId: getRateQuote
+      tags: [Rate quotes]
+      summary: Get a stored rate quote
+      description: Quotes are kept for 15 minutes after creation; after that they return `404`.
+      parameters:
+        - name: quote_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The quote
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RateQuote' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/webhook-subscriptions:
+    post:
+      operationId: createWebhookSubscription
+      tags: [Webhook subscriptions]
+      summary: Register a webhook endpoint
+      description: |
+        The URL must be `https` and must resolve to a public address; private, loopback, link-local and
+        metadata addresses are refused (`422`, `type` ending in `/webhook-url-not-allowed`). The response
+        contains the signing `secret` exactly once. Store it: it cannot be retrieved again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WebhookSubscriptionRequest' }
+      responses:
+        '201':
+          description: Subscription created. The signing secret is included this one time only.
+          headers:
+            Location:
+              description: URL of the subscription.
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookSubscriptionCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/webhook-subscriptions/{subscription_id}:
+    parameters:
+      - name: subscription_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      operationId: getWebhookSubscription
+      tags: [Webhook subscriptions]
+      summary: Get a webhook subscription (never includes the secret)
+      responses:
+        '200':
+          description: The subscription
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookSubscription' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    delete:
+      operationId: deleteWebhookSubscription
+      tags: [Webhook subscriptions]
+      summary: Delete a webhook subscription
+      description: Pending deliveries for this subscription are cancelled.
+      responses:
+        '204':
+          description: Deleted
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/dead-letters:
+    get:
+      operationId: listDeadLetters
+      tags: [Dead letters]
+      summary: List dead letters (ops scope)
+      description: Unresolved first, newest first within that. Requires an API key with the `ops` scope.
+      parameters:
+        - name: kind
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/DeadLetterKind' }
+        - name: resolved
+          in: query
+          required: false
+          description: Filter on whether the dead letter has been successfully replayed.
+          schema: { type: boolean }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of dead letters
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeadLetterPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/dead-letters/{dead_letter_id}:replay:
+    post:
+      operationId: replayDeadLetter
+      tags: [Dead letters]
+      summary: Replay a dead letter (ops scope)
+      description: |
+        A `row` dead letter is re-validated and, if it now passes (for example after a new status code was
+        mapped), upserted: `200`. A `webhook` dead letter is re-queued for delivery: `202`. Every replay
+        attempt writes an audit record (ops key, dead-letter ID, time, outcome).
+      parameters:
+        - name: dead_letter_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Row replayed and applied
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReplayResult' }
+        '202':
+          description: Webhook delivery re-queued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReplayResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Already resolved; nothing to replay.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /healthz:
+    get:
+      operationId: getLiveness
+      tags: [Health]
+      summary: Liveness probe (process is up)
+      security: []
+      responses:
+        '200':
+          description: Alive
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, enum: [ok] }
+
+  /readyz:
+    get:
+      operationId: getReadiness
+      tags: [Health]
+      summary: Readiness probe (dependencies reachable)
+      description: '`503` when the database or SFTP drop is unreachable. An open SOAP circuit is reported but does not fail readiness: reads still work.'
+      security: []
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+        '503':
+          description: Not ready
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+
+webhooks:
+  shipment.created:
+    post:
+      operationId: onShipmentCreated
+      summary: A shipment appeared in the AS/400 feed for the first time
+      tags: [Webhook subscriptions]
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/WebhookId'
+        - $ref: '#/components/parameters/WebhookTimestamp'
+        - $ref: '#/components/parameters/WebhookSignature'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ShipmentEvent' }
+      responses:
+        '200': { description: 'Any 2xx: delivered.' }
+        '410': { description: 'Gone: the gateway disables this subscription and stops sending.' }
+  shipment.status_changed:
+    post:
+      operationId: onShipmentStatusChanged
+      summary: A shipment's status changed
+      tags: [Webhook subscriptions]
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/WebhookId'
+        - $ref: '#/components/parameters/WebhookTimestamp'
+        - $ref: '#/components/parameters/WebhookSignature'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ShipmentEvent' }
+      responses:
+        '200': { description: 'Any 2xx: delivered.' }
+        '410': { description: 'Gone: the gateway disables this subscription and stops sending.' }
+  rate_quote.completed:
+    post:
+      operationId: onRateQuoteCompleted
+      summary: A rate quote you requested completed
+      tags: [Webhook subscriptions]
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/WebhookId'
+        - $ref: '#/components/parameters/WebhookTimestamp'
+        - $ref: '#/components/parameters/WebhookSignature'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RateQuoteEvent' }
+      responses:
+        '200': { description: 'Any 2xx: delivered.' }
+        '410': { description: 'Gone: the gateway disables this subscription and stops sending.' }
+
+components:
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: |
+        Per-shipper API key, stored server-side as a SHA-256 hash and rotated with overlap. Ops keys carry the
+        `ops` scope (OpenAPI cannot express scopes for API keys, so it is documented on each ops operation).
+
+  headers:
+    RetryAfter:
+      description: Seconds to wait before retrying (RFC 9110 delay-seconds form).
+      required: true
+      schema: { type: integer, minimum: 1 }
+
+  parameters:
+    UpdatedSince:
+      name: updated_since
+      in: query
+      required: false
+      description: Only shipments updated at or after this instant (RFC 3339).
+      schema: { type: string, format: date-time }
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor from a previous page's `next_cursor`.
+      schema: { type: string, minLength: 1, maxLength: 512 }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Page size.
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+
+    # Standard Webhooks request headers, sent on every event in the top-level `webhooks` section.
+    WebhookId:
+      name: webhook-id
+      in: header
+      required: true
+      description: Unique per event. Deliveries are at-least-once, so deduplicate on this value.
+      schema: { type: string }
+    WebhookTimestamp:
+      name: webhook-timestamp
+      in: header
+      required: true
+      description: Unix seconds when this attempt was signed. Reject if more than 5 minutes from your clock.
+      schema: { type: string, pattern: '^[0-9]+$' }
+    WebhookSignature:
+      name: webhook-signature
+      in: header
+      required: true
+      description: |
+        Space-separated list of `v1,<base64 HMAC-SHA256>` signatures over `{webhook-id}.{webhook-timestamp}.{body}`,
+        keyed with the base64-decoded part of your `whsec_` secret. During secret rotation two signatures are
+        sent for 24 hours; accept the request if any one matches.
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Malformed request (for example a cursor that is not valid or was issued for another filter).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Missing or unknown API key.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: The API key is valid but lacks the required scope (`ops`).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: No such resource for this API key (records of other shippers also return 404).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    PayloadTooLarge:
+      description: Request body larger than 64 KB.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    UnsupportedMediaType:
+      description: Request body must be `application/json`.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    ValidationFailed:
+      description: A parameter or the body failed validation; see `errors`.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    TooManyRequests:
+      description: Per-key rate limit exceeded.
+      headers:
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    InternalError:
+      description: Unexpected error. The `instance` value identifies it in the gateway's logs.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 9457 Problem Details. Unknown extension members must be ignored by clients.
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+          description: Identifies the problem type, e.g. `https://errors.meridian-gateway.example/request-in-progress`.
+        title: { type: string }
+        status: { type: integer, minimum: 400, maximum: 599 }
+        detail: { type: string }
+        instance:
+          type: string
+          format: uri-reference
+          description: Identifies this occurrence (a request ID), for support tickets.
+        errors:
+          type: array
+          description: Field-level validation errors (present on `422` validation failures).
+          items:
+            type: object
+            required: [location, message]
+            properties:
+              location: { type: string, description: 'JSON pointer or parameter location, e.g. `/body/origin_zip`.' }
+              message: { type: string }
+
+    ShipmentId:
+      type: string
+      minLength: 1
+      maxLength: 32
+      pattern: '^[A-Za-z0-9][A-Za-z0-9-]*$'
+
+    ShipmentStatus:
+      type: string
+      enum: [picked, loaded, in_transit, delivered, exception]
+
+    Shipment:
+      type: object
+      required: [shipment_id, order_no, status, ship_date, weight_lb, updated_at]
+      properties:
+        shipment_id: { $ref: '#/components/schemas/ShipmentId' }
+        order_no: { type: string }
+        status: { $ref: '#/components/schemas/ShipmentStatus' }
+        ship_date: { type: string, format: date }
+        weight_lb:
+          type: string
+          pattern: '^[0-9]+(\.[0-9]+)?$'
+          description: Decimal as a string, so no precision is lost in JSON parsers that use binary floats.
+        updated_at: { type: string, format: date-time }
+
+    ShipmentPage:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data:
+          type: array
+          maxItems: 200
+          items: { $ref: '#/components/schemas/Shipment' }
+        next_cursor:
+          type: [string, 'null']
+          description: Pass as `cursor` to get the next page; `null` at the end.
+
+    RateQuoteRequest:
+      type: object
+      additionalProperties: false
+      required: [origin_zip, dest_zip, weight_lb, service_level]
+      properties:
+        origin_zip: { type: string, pattern: '^[0-9]{5}$' }
+        dest_zip: { type: string, pattern: '^[0-9]{5}$' }
+        weight_lb: { type: number, exclusiveMinimum: 0, maximum: 45000 }
+        service_level: { type: string, enum: [LTL_STANDARD, LTL_EXPEDITED, FTL] }
+
+    RateQuote:
+      type: object
+      required: [quote_id, request, total_charge, currency, transit_days, created_at, expires_at]
+      properties:
+        quote_id: { type: string, format: uuid }
+        request: { $ref: '#/components/schemas/RateQuoteRequest' }
+        total_charge:
+          type: string
+          pattern: '^[0-9]+\.[0-9]{2}$'
+          description: Decimal amount as a string (e.g. `"412.50"`).
+        currency: { type: string, pattern: '^[A-Z]{3}$', description: ISO 4217 code. }
+        transit_days: { type: integer, minimum: 0 }
+        upstream_ref:
+          type: string
+          description: Meridian's quote reference, for their support desk.
+        created_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+
+    EventType:
+      type: string
+      enum: [shipment.created, shipment.status_changed, rate_quote.completed]
+
+    WebhookSubscriptionRequest:
+      type: object
+      additionalProperties: false
+      required: [url, event_types]
+      properties:
+        url:
+          type: string
+          format: uri
+          pattern: '^https://'
+          maxLength: 2048
+        event_types:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/EventType' }
+
+    WebhookSubscription:
+      type: object
+      required: [subscription_id, url, event_types, status, created_at]
+      properties:
+        subscription_id: { type: string, format: uuid }
+        url: { type: string, format: uri }
+        event_types:
+          type: array
+          items: { $ref: '#/components/schemas/EventType' }
+        status:
+          type: string
+          enum: [active, disabled]
+          description: '`disabled` after the endpoint answered `410 Gone`.'
+        created_at: { type: string, format: date-time }
+
+    WebhookSubscriptionCreated:
+      allOf:
+        - $ref: '#/components/schemas/WebhookSubscription'
+        - type: object
+          required: [secret]
+          properties:
+            secret:
+              type: string
+              pattern: '^whsec_[A-Za-z0-9+/]+={0,2}$'
+              description: Standard Webhooks signing secret. Returned only in this response.
+
+    ShipmentEvent:
+      type: object
+      required: [type, timestamp, data]
+      properties:
+        type: { type: string, enum: [shipment.created, shipment.status_changed] }
+        timestamp: { type: string, format: date-time }
+        data:
+          allOf:
+            - $ref: '#/components/schemas/Shipment'
+            - type: object
+              properties:
+                previous_status:
+                  oneOf:
+                    - $ref: '#/components/schemas/ShipmentStatus'
+                    - type: 'null'
+                  description: Set on `shipment.status_changed`; `null` on `shipment.created`.
+
+    RateQuoteEvent:
+      type: object
+      required: [type, timestamp, data]
+      properties:
+        type: { type: string, enum: [rate_quote.completed] }
+        timestamp: { type: string, format: date-time }
+        data: { $ref: '#/components/schemas/RateQuote' }
+
+    DeadLetterKind:
+      type: string
+      enum: [row, webhook]
+
+    DeadLetter:
+      type: object
+      required: [dead_letter_id, kind, reason, created_at, resolved]
+      properties:
+        dead_letter_id: { type: string, format: uuid }
+        kind: { $ref: '#/components/schemas/DeadLetterKind' }
+        reason: { type: string, description: "e.g. `unknown status code 'Q'` or `max age exceeded (last: HTTP 503)`" }
+        source:
+          type: object
+          description: '`row`: file name, line number and raw row. `webhook`: subscription, event type and attempt count.'
+          properties:
+            file_name: { type: string }
+            line_no: { type: integer, minimum: 1 }
+            raw: { type: string }
+            subscription_id: { type: string, format: uuid }
+            event_type: { $ref: '#/components/schemas/EventType' }
+            attempts: { type: integer, minimum: 0 }
+        created_at: { type: string, format: date-time }
+        resolved: { type: boolean }
+        replay_count: { type: integer, minimum: 0 }
+        last_replayed_at: { type: [string, 'null'], format: date-time }
+
+    DeadLetterPage:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data:
+          type: array
+          maxItems: 200
+          items: { $ref: '#/components/schemas/DeadLetter' }
+        next_cursor: { type: [string, 'null'] }
+
+    ReplayResult:
+      type: object
+      required: [dead_letter_id, kind, outcome]
+      properties:
+        dead_letter_id: { type: string, format: uuid }
+        kind: { $ref: '#/components/schemas/DeadLetterKind' }
+        outcome:
+          type: string
+          enum: [applied, queued]
+          description: '`applied`: the row was upserted. `queued`: the webhook delivery was re-queued.'
+
+    Readiness:
+      type: object
+      required: [status, db, sftp, soap_circuit]
+      properties:
+        status: { type: string, enum: [ready, not_ready] }
+        db: { type: string, enum: [ok, error] }
+        sftp: { type: string, enum: [ok, error] }
+        soap_circuit: { type: string, enum: [closed, half_open, open] }

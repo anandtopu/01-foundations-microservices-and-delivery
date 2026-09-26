@@ -1,0 +1,5 @@
+# Redocly CLI config (pinned to @redocly/cli@2.54.3 in the Makefile).
+# The ruleset is stated explicitly so a change in Redocly's default doesn't silently change the gate.
+# Deliberate exceptions are recorded per location in .redocly.lint-ignore.yaml, not turned off globally.
+extends:
+  - recommended
