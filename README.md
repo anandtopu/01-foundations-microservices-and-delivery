@@ -2,7 +2,7 @@
 
 A learning build from the FDE Onboarding Handbook. A Python 3.14 FastAPI gateway sits in front of a legacy AS/400 SFTP drop and a fragile SOAP rate-quote service. It provides idempotent quotes, a bulkhead, retries and a circuit breaker, signed webhooks through an outbox, and RFC 9457 errors.
 
-**Status:** M0 (toolchain), M1 (OpenAPI 3.1 contract), M2 (legacy stand-ins), M3 (CSV ingestion) and M4 (SOAP adapter) done; see [`docs/BUILD_LOG.md`](docs/BUILD_LOG.md). The build is done in Claude Code cloud sessions, following [`docs/CLOUD_BUILD_PROMPT.md`](docs/CLOUD_BUILD_PROMPT.md).
+**Status:** M0 (toolchain), M1 (OpenAPI 3.1 contract), M2 (legacy stand-ins), M3 (CSV ingestion), M4 (SOAP adapter) and M5 (resilience) done; see [`docs/BUILD_LOG.md`](docs/BUILD_LOG.md). The build is done in Claude Code cloud sessions, following [`docs/CLOUD_BUILD_PROMPT.md`](docs/CLOUD_BUILD_PROMPT.md).
 
 | Path | What it is |
 |---|---|
@@ -127,6 +127,34 @@ Re-record the SOAP golden fixtures from the mock (only when the mock's responses
 
 ```bash
 uv run python tests/soap/record_fixtures.py
+```
+
+Run the gateway API on the host (port 8000) against the mocks, in its own terminal:
+
+```bash
+make api-local
+```
+
+Ask for a rate quote (201, or a 503 Problem Details with `Retry-After` when Meridian is saturated):
+
+```bash
+curl -s -X POST localhost:8000/v1/rate-quotes -H 'Content-Type: application/json' -H 'Idempotency-Key: readme-0001-aaaaaaaa' -d '{"origin_zip":"30301","dest_zip":"60601","weight_lb":1200,"service_level":"LTL_STANDARD"}'
+```
+
+Reset the mock's counters, so its peak concurrency reflects only the burst:
+
+```bash
+curl -s -X POST localhost:8080/__reset
+```
+
+Burst it with 50 virtual users for 20 s (the M5 gate), then see what Meridian's side saw (`peak_concurrency` must be at most 4):
+
+```bash
+make load-quotes
+```
+
+```bash
+curl -s localhost:8080/__stats
 ```
 
 List every other target:

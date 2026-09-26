@@ -486,3 +486,195 @@ Each ran its own reproductions (scratch databases, local test servers) and edite
 **Lesson:** three reviewers with different focuses found two crash loops that my own tests missed. My crash test proved exactly-once under a *clean* failure, and nobody had tried *hostile input*. "Hostile input is reachable" is the question to ask of every parser. A second lesson came from my own fix: my first e2e guard looked right and was wrong, and only running it against a live poller showed that.
 
 ---
+
+## M5 — Resilience stack   (2026-09-26, session 3)
+
+**Goal / requirement served:** ADR-P01-1 (a global bulkhead of 4, a circuit breaker and bounded retries, with a fast `503` on saturation) and success criterion 2 ("no shipper behaviour, including aggressive retries, can push more than 4 concurrent requests onto the SOAP service"). FR-4's error contract: `503` + `Retry-After`, `502` for a Client fault. FR-8: RFC 9457 for every error.
+
+**What we built:**
+- `src/gateway/resilience.py`: the spec's `retry_full_jitter`, `State` and `CircuitBreaker` verbatim (line-wrapped), and `Bulkhead`, written from the spec's prose. Lab additions: `CircuitOpenError.retry_after`, `CircuitBreaker.retry_after()`, `Bulkhead.in_flight` and `retry_after_seconds()`.
+- `src/gateway/api/rate_quotes.py`: `QuoteService`, composing bulkhead → retry → breaker → per-attempt timeout, and `POST /v1/rate-quotes`. The route validates the contract's `Idempotency-Key` header; storing it is M6's job.
+- `src/gateway/errors.py`: `ProblemError` and one exception handler per outcome. `BulkheadFull` / `CircuitOpenError` / retries exhausted → `503` + `Retry-After`; `UpstreamRejected` → `502` with a generic detail; validation → `422` with an `errors[]` list; anything else → a bare `500`.
+- `src/gateway/app.py`: `create_app()` with a lifespan that owns one pooled `httpx.AsyncClient` and the resilience objects.
+- `src/gateway/config.py` and `.env.example`: `SOAP_BASE_URL`, `SOAP_MAX_CONCURRENCY=4`, `SOAP_BULKHEAD_WAIT_S=0.2`, `BREAKER_FAILURE_THRESHOLD=5`, `BREAKER_RESET_AFTER_S=30`.
+- `load/quotes.js`: the k6 50-VU burst, with thresholds (every response is a 201, or a 503 carrying `Retry-After`; p95 of 503s under 500 ms).
+- `tests/unit/test_resilience.py` (30 tests): every breaker state, including cancellation; jitter bounds; the deadline; the bulkhead; and the composed path, including the gate in miniature.
+- `tests/unit/test_api_rate_quotes.py` (12 tests): the contract mapping for each outcome, and a check that no upstream internals leak.
+- `Makefile`: `api-local`, `load-quotes`. README quick-start steps. ARCHITECTURE differences 18–21.
+
+**How it works:**
+- **Composition order, outside-in: bulkhead → retry → breaker → timeout.** Each layer protects the ones inside it.
+  - The **bulkhead** is a `Semaphore(4)`. It limits how many calls reach Meridian, however many shippers are waiting and however many retries each makes. A request waits at most 0.2 s for a slot, then gets a `503` `upstream-saturated` with `Retry-After: 2`.
+  - It is outermost so a request **keeps its slot for its retries**. If it sat inside the retry loop, a request could be refused halfway through, after already spending attempts.
+  - The **retry** makes up to 3 attempts within a 4 s budget. (As merged after the PR #3 review, each attempt is also cut off at the budget. The spec's code only checked the budget before a sleep, so the worst case was about 6.2 s.) The wait before attempt *n* is drawn uniformly from `[0, min(2 s, 0.2 s × 2^n)]`: **full jitter**. It retries only `RetryableError`; a Client fault is never retried.
+  - The **breaker** sits inside the retry loop. After 5 consecutive retryable failures it opens. (After the PR #3 review, results from calls admitted before it opened no longer change its state.) While open, calls fail in about 1 ms without touching Meridian, and `CircuitOpenError` isn't retryable, so it ends the retry loop at once. After 30 s it goes half-open and admits exactly **one** trial call: success closes it, failure reopens it for another 30 s.
+  - The **timeout** is M4's total 3 s deadline per attempt.
+- **Why jitter matters (the 2025-06-12 Google Cloud incident the spec cites; [incident report](https://status.cloud.google.com/incidents/ow5i3PPK96RduMcb1SsW), linked from `spec/P01-P04-full-projects-file.md` Sources):** a policy change with blank fields crashed Google's Service Control binaries worldwide. When they *restarted* in the large us-central1 region, the tasks re-read their data from the Spanner table they depend on together, a "herd effect", because Service Control did not have randomized exponential backoff. That synchronized "herd" overloaded Spanner and made that region's recovery take far longer than the others. With plain exponential backoff, clients that failed together retry together (0.2 s, 0.4 s, 0.8 s…) and hit the recovering service in waves. Full jitter spreads each wave evenly across the window, so a recovering dependency sees a trickle instead of a stampede.
+- **The breaker needs no lock:** no `await` separates a state check from the change it makes, so on one event loop nothing can interleave there. With threads, or free-threaded Python, it would need one.
+- **`except BaseException` in the breaker matters.** When a shipper disconnects, the half-open trial's task is *cancelled*, and `CancelledError` is not an `Exception`. Without that branch, `_trial` would stay `True` and every later call would get "trial in flight" forever. The breaker would be wedged half-open until a restart.
+- **Retry-After is honest:** `2` s for saturation and for retries exhausted (ADR-P01-1). For an open circuit it is the time until the trial, rounded *up* to whole seconds (RFC 9110 delay-seconds; never `0`).
+- **Upstream internals stay internal:** Meridian's `faultstring` is logged, never returned. A `502` says "check ZIPs, weight, service level", not `CPF4131 member QTEMP/RQ locked`.
+
+**Commands run, in order:**
+1. Read the spec's M5 section, the contract's `Problem` schema, the `502`/`503` responses and the `Idempotency-Key` parameter (min 16, max 128, `^[\x21-\x7E]+$`).
+2. Wrote `resilience.py`, `errors.py`, `api/rate_quotes.py`, `app.py` and the config. `ruff` + `mypy --strict` → clean after wrapping 4 long lines.
+3. **The VM restarted** mid-milestone (`uptime` 2 min, `docker` unreachable, the live tests suddenly skipping). The disk survived: `secrets/`, `.env` and Docker's volumes were all intact. I re-ran `bash scripts/cloud-setup.sh` (`INFO: docker daemon not running; starting dockerd`) and `docker compose up -d` → 4 healthy. The host key still matched the pin, because it lives on the `sftp-hostkeys` volume. `make migrate-local` → none pending.
+4. `pytest tests/unit/test_resilience.py` **hung** (see "What broke" 1). I stopped it, fixed the fixture, and got 30 passed in 1.2 s.
+5. `pytest tests/unit/test_api_rate_quotes.py` → 12 passed.
+6. The live gate, part 1 (breaker), then part 2 (k6). Below.
+7. Mutation checks on `resilience.py` (below). `make check` → **202 passed**, ruff and mypy clean.
+
+**Verification:** the Done-when gate, against the live API (`make api-local`) and the SOAP mock.
+
+*Part 1: with the mock at `{"busy_rate": 1.0}`, the breaker opens after 5 failed attempts (on the 2nd call), and every later call is a `503` in under 10 ms:*
+
+```text
+healthy:  201 0.332s  total_charge=974.56 transit_days=5
+call 1:   503 1.196s  type=upstream-busy  Retry-After: 2    (3 attempts)
+call 2:   503 1.000s  type=circuit-open   Retry-After: 30   (attempts 4, 5 -> breaker opens)
+call 3:   503 0.0017s type=circuit-open   Retry-After: 30
+mock /__stats after 3 calls:  {"calls":5,"busy_faults":5}
+20 more calls while open:     all 503, latency min 1.0 ms, median 1.3 ms, max 1.9 ms
+mock /__stats after all:      {"calls":5, ...}          <- not one more call reached Meridian
+```
+
+The commands behind Part 1 (API running via `make api-local`):
+
+```bash
+curl -s -X POST localhost:8080/__faults -H 'Content-Type: application/json' -d '{"busy_rate":1.0}'
+curl -s -X POST localhost:8080/__reset
+for n in 1 2 3; do curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' -X POST localhost:8000/v1/rate-quotes -H 'Content-Type: application/json' -H "Idempotency-Key: gate-$n-aaaaaaaaaaaa" -d '{"origin_zip":"30301","dest_zip":"60601","weight_lb":1200,"service_level":"LTL_STANDARD"}'; done
+curl -s localhost:8080/__stats
+```
+
+*Part 2: a 50-VU k6 burst for 20 s against a healthy mock (300 ms latency). What Meridian saw:*
+
+```text
+mock /__stats: {"calls":264,"ok":264,"busy_faults":0,"peak_concurrency":4}
+k6: 4,609 requests = 264 x 201 + 4,345 x 503 (every one with Retry-After)
+    (in this first run the split was derived from the mock's ok=264; since the PR #3 review, the
+     script's http_reqs{status:201|503} thresholds print it: count=264 and count=4345 on the re-run)
+    checks 100% (9,218/9,218); thresholds passed
+    503 latency p95 205 ms (the 0.2 s bulkhead wait); 201 latency median 476 ms
+```
+
+| Gate item | Target | Measured |
+|---|---|---|
+| Breaker opens after 5 failed attempts | on the 2nd call | ✅ on the 2nd call; the mock saw exactly 5 calls |
+| Later calls return 503 | under 10 ms | ✅ median 1.3 ms, max 1.9 ms (20 calls) |
+| Peak concurrency at the mock, 50-VU burst | ≤ 4 | ✅ **4** |
+| Every 503 carries `Retry-After` | 100% | ✅ 4,345/4,345 |
+
+Throughput sanity check: 264 successes in 20 s is 13.2/s, and the theoretical ceiling is 4 slots ÷ 0.3 s = 13.3/s. The bulkhead is *fully used and never exceeded*. The other 50 − 4 = 46 VUs are shed in about 200 ms each.
+
+**Mutation check** (each applied to `resilience.py`, run, then restored):
+
+| Mutation | Result |
+|---|---|
+| Don't reset `_trial` on `BaseException` | ❌ caught by `test_cancelled_trial_does_not_wedge_half_open` |
+| Plain exponential backoff (no jitter) | ❌ caught by `test_retry_recovers_from_transient_failures` |
+| Drop `state is HALF_OPEN or` from the reopen condition | ✅ survived. This is an **equivalent mutant**: the spec's breaker resets `failures` only on success, so a failed trial always has `failures ≥ threshold` and reopens by count anyway. The clause is defence in depth (it matters if someone resets the count on open); no test can tell them apart, so none pretends to. |
+
+**What broke and how we fixed it:**
+1. *The unit tests hung.*
+   - *Symptom:* `pytest tests/unit/test_resilience.py` never finished (a 2-minute timeout, moved to the background, stopped with `TaskStop`).
+   - *Hypothesis:* a fake clock that stops time also stops asyncio.
+   - *Evidence:* the fixture did `monkeypatch.setattr(resilience.time, "monotonic", clock)`. `resilience.time` *is* the global `time` module, and asyncio's event loop reads `time.monotonic()` for every timer.
+   - *Root cause:* freezing the global clock froze every `asyncio.sleep` and `wait_for` in the process.
+   - *Fix:* replace only the *name* `time` inside `gateway.resilience` (`SimpleNamespace(monotonic=clock)`). The spec's code is unchanged, the loop keeps real time, and the run went from hanging to 30 passed in 1.2 s.
+2. *The live tests suddenly skipped.*
+   - *Symptom:* "55 passed, 3 skipped" instead of 58.
+   - *Evidence:* `docker compose ps` → "Cannot connect to the Docker daemon", and `uptime` 2 min.
+   - *Root cause:* the VM restarted; the processes were gone and the disk was intact.
+   - *Fix:* the session-start restore (setup script, compose up, host-key check, migrate).
+   - *Lesson:* a skipped test is not a passing test. The gate numbers need `make mocks`, which is why the verification sections say so.
+3. *An API that looked still up after a kill.*
+   - *Symptom:* killing the `make api-local` PID printed "api still up" 2 s later.
+   - *Hypothesis:* the uvicorn child survived its parent, so a stale API (breaker still open) would answer k6.
+   - *Evidence:* `ps` showed only the *new* API's process tree (8 s old), answering 201s.
+   - *Root cause:* shutdown simply took longer than 2 s.
+   - *Fix:* none needed, but the final stop now kills make, uv and uvicorn by their PIDs and checks port 8000 is closed. Checking before trusting the k6 numbers is the point.
+4. *A claim that was stronger than the truth (self-review).* The first docstring said the bulkhead must be outermost "so at most 4 calls reach Meridian". A bulkhead inside the retry loop would also cap at 4. The real reason is that a request keeps its slot for its retries and can't be refused halfway through. I fixed the docstring, and renamed the test to what it proves.
+
+**Cloud vs real customer environment:** in the lab, one API process holds the only bulkhead. At Meridian there would be 2+ replicas, and a per-process `Semaphore(4)` would allow 4 *per replica*: 8 with two pods, breaking ADR-P01-1. The options are:
+- size each replica's bulkhead as floor(4 ÷ replicas) and pin the replica count;
+- put a shared limiter in front, for example Postgres advisory locks as tokens, or the API gateway's concurrency limit;
+- route all SOAP calls through one "SOAP broker" instance.
+
+The breaker is per process too, so each replica learns separately that Meridian is down. That's acceptable, and it's why the threshold is small. The 300 ms mock latency is optimistic: Meridian's p99 is 2.8 s, which cuts the ceiling to about 1.4 quotes/s. The 503 rate at peak is therefore a *capacity* conversation with Meridian and the shippers, and the contract already tells shippers to honour `Retry-After`.
+
+**Check yourself:**
+1. Why is the breaker *inside* the retry loop and the bulkhead *outside* it? What goes wrong with each the other way round?
+2. 1,000 shippers' requests fail at the same instant and all retry with plain exponential backoff (0.2 s, 0.4 s, 0.8 s). Describe the load Meridian sees for the next 2 s, then the same with full jitter.
+3. A shipper cancels a request while it is the breaker's half-open trial. What would happen without `except BaseException: self._trial = False`, and why wouldn't `except Exception` be enough?
+
+<details><summary>answers</summary>
+
+1. **The breaker inside the retry loop:** each attempt passes through it, so the attempt that opens it is followed by an attempt that gets `CircuitOpenError`. That error isn't retryable, so the request stops at once. With the breaker *outside*, one request's retries would all run before the breaker saw a single outcome, and an open breaker could not stop retries already in progress. **The bulkhead outside the retry loop:** a request takes one slot and keeps it for all its attempts, so the cap of 4 holds and a request is never refused halfway through. With the bulkhead *inside*, each attempt re-competes for a slot. A request that already made two attempts could lose the third to a newcomer and return a 503 after doing real work, and fairness gets worse under load.
+2. **Plain exponential:** Meridian sees three synchronized spikes of about 1,000 calls each, at t = 0.2, 0.6 and 1.4 s, with silence between them. Each spike blows far past its 5-concurrent limit, so almost every call fails with `Server.Busy`, and the herd reforms on the next step. That's the 2025-06-12 Spanner overload pattern. **Full jitter:** each retry lands uniformly within `[0, 0.2]`, `[0, 0.4]`, `[0, 0.8]`, so the same 1,000 retries arrive as a smooth, spread-out flow. Meridian can recover, and the breaker and bulkhead see honest signals. (Our bulkhead would cap it at 4 anyway; jitter is what stops *uncoordinated* clients, like the shippers themselves, from stampeding.)
+3. The trial's task gets `CancelledError`, which is a `BaseException`, not an `Exception`. Without that branch, `_trial` stays `True` forever. The breaker is `HALF_OPEN`, and every later call hits "half-open trial in flight" and gets a 503 **indefinitely**, even after Meridian recovers, until the process restarts. `except Exception` would miss `CancelledError` (and `KeyboardInterrupt`) for exactly that reason. Resetting the flag and re-raising is what makes cancellation safe.
+</details>
+
+**What would break in production here (spec section 12):**
+- **More than one replica.** Each replica has its own `Semaphore(4)`, so two pods can send 8 concurrent calls, and Meridian starts returning `Server.Busy` to *everyone*, including its own callers. This is the most likely way to break ADR-P01-1 in production; pin the replica count or share the limiter.
+- **A breaker threshold tuned for the lab.** 5 failures and 30 s suit a mock. Against real traffic with an intermittent 10% busy rate, a stretch of bad luck can open the breaker, which turns a 10% error rate into 100% for 30 s. Watch `breaker state changes` (section 8) and tune from real data.
+- **Shippers who ignore `Retry-After`.** They hammer the gateway, not Meridian (the bulkhead holds), but they burn our CPU and each other's slots. The per-key `429` rate limit in the contract is the next defence.
+
+---
+
+## PR #3 review — three independent review agents   (2026-09-26, session 3)
+
+**What happened:** before merging PR #3 (M5), three review agents read the diff in parallel, each with its own focus:
+1. resilience correctness and concurrency;
+2. API, errors and security;
+3. spec fidelity, gate honesty and the docs.
+
+Two of them independently re-ran the live gate, on their own ports (8765 and 8766, so the lab API on 8000 was untouched), and **the claims reproduced**:
+- breaker open on the 2nd call, with the mock at 5 calls;
+- circuit-open 503s at 1.1–2.6 ms;
+- a 10 s k6 burst with the mock's `peak_concurrency` at 4.
+
+I re-verified each finding (reproducing the most important one myself), fixed it with a regression test, and mutation-checked the fixes: every new test fails against the old code.
+
+**Findings and outcomes:**
+
+| # | Finding | Severity | Reproduced? | Fix | Regression test |
+|---|---|---|---|---|---|
+| 1 | **The breaker accepted stale results.** A call admitted while CLOSED that succeeded *after* the breaker opened closed it at once (`OPEN 5` → `CLOSED 0`), skipping the 30 s cool-down and the single half-open trial. Stale failures pushed `opened_at` back. Any finishing call could clear the trial flag, admitting a second trial. With `busy_rate` 0.8 and 4 calls in flight, the first case happens about half the time. | should-fix (spec code) | yes, by me and by the reviewer | A generation counter (bumped on every open; stale results don't move the state) and trial ownership. Difference 22. | `test_late_success_from_before_the_open_does_not_close_it`, `test_late_failures_do_not_extend_the_open_window`, `test_a_stale_call_cannot_clear_the_trial_flag`; the spec breaker → 3 failures |
+| 2 | **The 4 s deadline didn't limit how long an attempt ran:** the worst case was about 6.2 s holding a bulkhead slot (a 4:1 scaled repro gave 1.5 s against a 1.0 s budget) | should-fix (spec code) | yes (by the reviewer) | `asyncio.timeout_at(stop_at)` around each attempt → `RetryableError` (not a bare `TimeoutError`, which would become a 500). Difference 23. | `test_the_deadline_also_bounds_a_running_attempt`; mutant → hangs 10 s and fails |
+| 3 | Upstream values reached a 201 unvalidated: `"1e3"`, `"usd"`, `"<script>"`, `-4`, a 23-digit day count, `"1_0"` | should-fix | yes (by the reviewer) | Strict patterns → `502 upstream-invalid-response`, which says it is *not* the shipper's fault; money normalised to 2 decimals. Difference 24. | `test_unusable_upstream_data_never_becomes_a_201[10 cases]`; mutant → 11 failures |
+| 4 | No body limit: a 10.5 MB body cost 2.7 s of CPU and returned a **22 MB** 422 | should-fix | yes (by the reviewer) | `RequestGuard`: 413 over 64 KiB (chunked too); `errors[]` capped at 20. Difference 25. | `test_oversize_body_is_413_*`, `test_validation_errors_are_capped_and_pointer_escaped` |
+| 5 | 404 and 405 were plain `{"detail":…}`; the contract's 415 was never returned (a text/plain body gave a 422) | should-fix | yes (by the reviewer) | A Starlette `HTTPException` handler (keeps `Allow`), and 415 in `RequestGuard` | `test_routing_errors_are_problem_details`, `test_non_json_bodies_are_415`; mutant (no guard) → 4 failures |
+| 6 | Malformed JSON gave 422 with `/body/14` (a character offset); pointers weren't RFC 6901-escaped | nit | yes | 400 `malformed-json`; `~0`/`~1` escaping | `test_malformed_json_is_400`, the pointer test |
+| 7 | No `instance` on 500s; `server: uvicorn`; `/openapi.json` served FastAPI's generated schema, which differs from the contract | nit | yes | `urn:uuid:` instance logged with the traceback; `--no-server-header`; `openapi_url=None`. Difference 26. | `test_500_carries_an_instance_for_support`, `test_no_generated_openapi_is_published` |
+| 8 | k6 could pass vacuously (zero 503s → `p(95)=0s` ✓); the `Retry-After` check accepted any value; the 201/503 split wasn't printed | nit | yes (by the reviewer) | `http_reqs{status:201\|503}` `count>0` thresholds (they also print the split); a `^[1-9][0-9]*$` check; `--no-usage-report` (k6 was calling `stats.grafana.org`, which is blocked) | re-run: `count=264`, `count=4345` |
+| 9 | Tests: `< 0.01 s` wall-clock asserts **flaked 1 run in 6** under load; `test_jitter_really_is_random` never called our code | should-fix | yes (by the reviewer) | The wall-clock asserts were removed (the call counts prove fail-fast; the live gate measures the ms); the jitter test now runs `retry_full_jitter` 200 times and checks the delays are distinct and spread | `test_retry_delays_are_spread_not_synchronised` |
+| 10 | Unmarked spec edits (the `CircuitOpenError` arguments), and a docstring claiming "verbatim"; no row for Retry-After `1` | should-fix | yes | `lab:` markers; docstring and difference 21 updated | n/a |
+| 11 | BUILD_LOG: the "4 s budget" claim overstated; no literal gate commands; the k6 split presented as k6 output; the Google incident with no link and "retried" instead of "restarted"; the README didn't reset stats before the burst | should-fix / nit | yes | Corrected in the M5 section and README | n/a |
+| 12 | `attempts=0` raised `AssertionError('unreachable')` | nit | yes | `ValueError` | `test_attempts_must_be_positive` |
+
+**Checked and fine (no change):**
+- **The bulkhead's `wait_for(sem.acquire())`** doesn't leak permits on Python 3.14.7. The reviewer ran 300 rounds with 1,151 cancels at the wait boundary, and a deterministic same-tick test.
+- **Outer cancellation** always releases the slot.
+- **The composition order** is exactly bulkhead → retry → breaker → timeout.
+- **The catch-all 500 handler** works under real uvicorn and leaks nothing.
+- **The "equivalent mutant" claim** in M5 was correct. With difference 22 it no longer applies, since the trial now reopens by ownership.
+
+**Not changed (with reason):**
+- **A header validation error returns 422, not 400.** Both are documented statuses, and the contract's 422 covers "validation". This will be revisited with Schemathesis in M8.
+- **An `UpstreamRejected` during the half-open trial leaves the breaker half-open,** so the next caller becomes the trial. That's harmless and intended: a Client fault says nothing about upstream health.
+- **The per-replica bulkhead** stays per process. M8 pins a single replica (see M5 "Cloud vs real").
+
+**Verification after the fixes:**
+- **`make check`:** ruff and `mypy --strict` clean, **227 passed**.
+- **Live gate re-run on the fixed code:**
+  - breaker open on the 2nd call, with the mock at 5 calls;
+  - 20 calls while open: median **1.2 ms**, max 1.5 ms;
+  - 404 → `application/problem+json`, and no `server` header;
+  - k6 50 VUs for 20 s → **264 × 201, 4,345 × 503**, all thresholds passed, mock `peak_concurrency` **4**.
+
+**Lesson:**
+- **The live gate couldn't see the stale-result bug.** It runs at `busy_rate` 1.0, where every call fails, so a late *success* never happens. Concurrency bugs hide in the mixed cases, which is where a reviewer's small `asyncio` script beats a load test.
+- **A unit test that measures wall-clock time is a flaky test in waiting.** Assert behaviour (call counts) in unit tests, and measure time in the live gate.
+
+---
