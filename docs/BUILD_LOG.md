@@ -350,3 +350,91 @@ $ docker compose exec postgres psql -U gateway -d gateway -c "select count(*) fr
 - **The drop fills with years of files.** The listing and fast-path queries grow every cycle. Ask Meridian for an archive or retention job on their side; our side can't delete (read-only by design).
 
 ---
+
+## M4 — SOAP adapter with safe XML   (2026-09-26, session 3)
+
+**Goal / requirement served:** FR-3/FR-4 (rate quotes through Meridian's SOAP service), ADR-P01-1 (M5's retry loop needs a clean retryable/non-retryable split), and section 9's tampering row (XXE and entity expansion in SOAP responses: `defusedxml` for every parse).
+
+**What we built:**
+- `src/gateway/soap/client.py`: the spec's adapter verbatim, with three marked lab additions (see "How it works"). It builds the envelope with a Python 3.14 t-string and `render_xml`, POSTs with `SOAPAction` and a 3 s / 0.5 s-connect timeout, and parses with `defusedxml`.
+- `src/gateway/resilience.py`: `RetryableError` only for now. M5 adds the bulkhead, retry and breaker to this module.
+- `src/gateway/api/rate_quotes.py`: `RateQuoteRequest`, mirroring the contract. M6 adds the route.
+- `tests/soap/fixtures/{success.200,client_fault.500,server_busy.500}.xml`: golden responses **recorded from the mock** by `tests/soap/record_fixtures.py`. The HTTP status is part of the file name.
+- `tests/soap/test_client.py` (31 tests, no network): the golden mapping, envelope and headers, escaping, the `<x/>` gate, contract-level validation, transport failures, and hostile or malformed responses.
+- `tests/soap/test_live_mock.py` (3 tests): the real round trip against the mock, so the fixtures cannot drift.
+- `pyproject.toml`: `types-defusedxml==0.7.0.20260504` (typeshed stubs) as a dev dependency, so `mypy --strict` checks our defusedxml calls instead of ignoring them.
+
+**How it works:**
+- **t-strings (PEP 750) make escaping structural.** `t"…{q.origin_zip}…"` is not a string; it's a `Template` of literal parts and `Interpolation` objects. `render_xml` escapes every interpolation and passes literal parts through untouched. There's no way to forget to escape, because the interpolated values never go through an f-string.
+- **Validation happens before rendering.** `RateQuoteRequest` (pattern `^[0-9]{5}$`) rejects `<x/>` before any XML exists. The escaping is defence in depth, not the only line of defence.
+- **Faults are classified by `faultcode`, not HTTP status.** SOAP 1.1 sends *every* fault as HTTP 500 (the two recorded fault fixtures prove it). `Server.Busy` becomes `RetryableError`; anything else (`Client`) becomes `UpstreamRejected`, because retrying a request the server called wrong just hammers it.
+- **Transport failures are retryable:** connect errors, timeouts and 502/503/504. This is safe **only** because `GetRateQuote` has no side effects. A call that creates something retries only with an upstream idempotency token, or not at all.
+- **defusedxml** refuses DTDs and entity declarations, so an XXE (`file:///etc/passwd`) or a billion-laughs response is rejected before expansion.
+- **Lab addition 1:** the `QuoteInput` Protocol types `q` without importing the API layer, so the dependencies point inwards.
+- **Lab addition 2:** `render_xml` also escapes quotes, so an interpolation is safe inside an attribute too.
+- **Lab addition 3:** an unparseable or hostile response becomes `UpstreamRejected`. The spec's code would let `ParseError` / `EntitiesForbidden` escape as an unclassified 500.
+- **Strict request model:** `RateQuoteRequest` is `strict=True`, so `"1200"` is not a number (the contract says `type: number`); `extra="forbid"` enforces `additionalProperties: false`. It uses `[0-9]`, never `\d`, because Python's `\d` accepts `٣٠٣٠١` (Arabic-Indic digits).
+
+**Commands run, in order:**
+1. `sed -n '/M4 — SOAP adapter/,/M5 — /p' spec/…` to read the spec. Then the M5 section, for `RetryableError`'s home, and the contract's `RateQuoteRequest` and `RateQuote` schemas.
+2. Read `mocks/soap/app.py`: faults are HTTP 500 with an unqualified `<faultcode>`; `origin_zip=00000` is the mock's stable Client-fault trigger.
+3. `uv run python tests/soap/record_fixtures.py` recorded 3 fixtures (441, 278 and 293 bytes). It set `busy_rate 1.0` for the Busy fixture, then restored the defaults (`/__stats` confirmed `busy_rate 0.0`).
+4. `uv run pytest tests/soap -q` → **31 passed** at the first run.
+5. `ruff` → 6 findings: 5 long lines, and **RUF043** (`match="Server.Busy"` has an unescaped `.`; now `r"Server\.Busy"`). `mypy` → `defusedxml` has no stubs; I added `types-defusedxml` rather than an `ignore`.
+6. Three mutations of `client.py` (below). Each one was caught.
+7. Added the live tests, then `uv run pytest tests/soap -q` → **34 passed**. `make check` → **115 passed**, ruff and mypy clean.
+
+**Verification:** the Done-when gate.
+
+```text
+$ uv run pytest tests/soap -q
+..................................                                       [100%]
+34 passed in 0.38s
+```
+
+| Gate item | Test | Result |
+|---|---|---|
+| Recorded success → dict | `test_success_maps_to_dict` | ✅ `{QuoteRef, TotalCharge: 974.56, Currency: USD, TransitDays: 5}` |
+| Recorded `Client` fault → `UpstreamRejected` | `test_client_fault_is_upstream_rejected` | ✅ `soapenv:Client: origin ZIP not served` |
+| Recorded `Server.Busy` → `RetryableError` | `test_server_busy_fault_is_retryable` | ✅ |
+| `<x/>` rejected by Pydantic before any XML | `test_bad_origin_zip_rejected_before_xml[<x/>]` | ✅ the transport fails the test if called; it never is |
+| XXE / billion laughs | `test_hostile_or_malformed_responses_are_rejected[xxe, billion_laughs]` | ✅ `EntitiesForbidden` → `UpstreamRejected` |
+| Live mock accepts our envelope | `test_live_success` | ✅ `/__stats` ok=1, client_faults=0 |
+
+**Mutation check** (each one applied to `client.py`, run, then restored):
+
+| Mutation | Caught by |
+|---|---|
+| `render_xml` stops escaping | `test_render_xml_escapes_every_interpolation` |
+| Every fault treated as retryable | `test_client_fault_is_upstream_rejected` |
+| `defusedxml` replaced by `xml.etree` | `test_hostile_…[xxe]` and `[billion_laughs]` |
+
+**What broke and how we fixed it:**
+1. *A test that could not fail (self-review, before the first run).* The first version of the `<x/>` test asserted that an empty `calls` list was empty; nothing ever appended to it. I replaced it with a transport that calls `pytest.fail` if an envelope is sent, and made the test follow the API's real sequence (validate, then call).
+2. *RUF043:* `pytest.raises(match="Server.Busy")` is a regex, and `.` matches any character, so `ServerXBusy` would also have passed. It is now `r"Server\.Busy"`. A small bug, but exactly the kind that hides a wrong fault code.
+3. *mypy `import-untyped` for defusedxml.* An `ignore` would have made every defusedxml call `Any` and hidden real type errors. I installed the typeshed stubs as a pinned dev dependency instead.
+
+**Spec observations (not changed, flagged):**
+- The spec's `get_rate_quote` doesn't handle a non-XML or hostile response. The lab maps it to `UpstreamRejected` (difference 10). Proposed spec fix: add `except (ParseError, DefusedXmlException)` around `ET.fromstring`.
+- The spec's `render_xml` escapes element text only (difference 9). It's safe today, because only constants go into attributes, but it's fragile.
+
+**Cloud vs real customer environment:** Meridian's real WSDL decides the element names, namespaces and `SOAPAction`, and we'd record the golden fixtures in their test window, not from our mock, with their written OK. The endpoint sits behind their WAF, possibly with mutual TLS or WS-Security. With WS-Security, the envelope needs a signed header, and a t-string template would still render the body. The 3 s read timeout is sized against their p99 of 2.8 s; if their p99 moves, it moves too, and ADR-P01-1's contract `Retry-After` follows. In production the fixture recorder is also how you capture "what did they actually send" during an incident, with PII scrubbed.
+
+**Check yourself:**
+1. With `render_xml`, what makes it *impossible* to forget escaping one value, and why wouldn't an f-string plus a helper you call on each value give the same guarantee?
+2. Both faults arrive as HTTP 500. Why is `Server.Busy` retried but `Client` not, and what would retrying `Client` faults do to Meridian at peak?
+3. We already validate `origin_zip` with a regex. Why still escape, and why still use defusedxml for responses from a service we "trust"?
+
+<details><summary>answers</summary>
+
+1. A t-string evaluates to a `Template` that keeps the literal parts and the interpolated values *separate*. `render_xml` sees every `Interpolation` as a distinct object and escapes it, so there's no code path where a value is concatenated raw. With an f-string, interpolation happens *before* your helper sees anything: the result is one flat string, and correctness depends on every author wrapping every value in `escape(...)` every time. One forgotten call is an injection. The template makes the safe way the only way.
+2. `Server.Busy` is transient: the same request may succeed a moment later, and `GetRateQuote` has no side effects, so a retry is safe. A `Client` fault says the request itself is wrong (an unsupported ZIP, a bad weight), so every retry fails the same way and burns one of Meridian's 5 concurrent slots. At peak that turns one bad shipper request into several wasted calls, and it can push other shippers into `Server.Busy`. That's the retry storm ADR-P01-1 exists to prevent. `UpstreamRejected` ends it immediately and becomes a 502 with a clear message.
+3. Defence in depth. The regex protects *this* field today; the escaping protects every future field someone adds to the template without thinking (a free-text reference, a company name with `&`). A "trusted" service can still be compromised, misconfigured, or sit behind a proxy that returns an HTML error page, and XXE and billion laughs turn a parser into a file reader or a memory bomb. The rule in section 9 is "defusedxml for every parse", because trust isn't a parser setting.
+</details>
+
+**What would break in production here (spec section 12):**
+- **Meridian changes the fault code** (for example `soapenv:Server.Overloaded`, or a SOAP 1.2 `Receiver` code). It falls through to `UpstreamRejected`: no retries, and shippers get 502s at peak instead of a 503 with `Retry-After`. Mitigation: a contract test against their test endpoint on every release, and an alert on the rate of `UpstreamRejected` by fault code.
+- **Their p99 creeps above 3 s.** Healthy but slow calls time out, get retried and add load. It needs latency SLO monitoring on the upstream, with the timeout reviewed jointly.
+- **A WSDL namespace bump** (`v2` → `v3`) makes the result lookup return `None`, so every quote becomes `UpstreamRejected: response has no GetRateQuoteResult`. The golden fixtures make this a failing test the day you re-record, not a production incident.
+
+---

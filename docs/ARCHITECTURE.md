@@ -74,3 +74,11 @@ sftp-poller, every 60 s (5 s demo), one active replica (pg_try_advisory_lock)
        upsert shipments (no-op if unchanged) + dead_letters (row) + last_line checkpoint
   6. status = done
 ```
+
+### M4 additions to the differences log
+
+| # | Difference | Why | Milestone |
+|---|---|---|---|
+| 9 | `render_xml` also escapes `"` and `'` | `saxutils.escape` covers only `& < >`, which is safe in element text but not in attribute values; the spec's helper would be unsafe the day someone interpolates into an attribute | M4 |
+| 10 | A malformed or DTD/entity-bearing SOAP response raises `UpstreamRejected` (API: 502), never retried | The spec's code lets `ParseError` / `EntitiesForbidden` escape unclassified, which would surface as a raw 500 and bypass the M5 error taxonomy | M4 |
+| 11 | `RateQuoteRequest` is `strict=True, extra="forbid"`, ZIP pattern `[0-9]{5}` (not `\d`) | Matches the contract exactly (`type: number`, `additionalProperties: false`), so M8 Schemathesis negative tests pass; `\d` would accept non-ASCII digits | M4 |
