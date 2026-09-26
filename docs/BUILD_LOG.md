@@ -884,10 +884,92 @@ The security reviewer confirmed tenant isolation: there was no cross-shipper rep
 - **Replay re-queues the *same* delivery** (same `webhook-id`, `attempts` 0, a fresh window) and answers `202`: queued isn't delivered. The dead letter is resolved by the dispatcher when the delivery really lands. The audit row commits *before* any `409`/`422` is raised, so failed replays leave a trace too.
 
 **Commands run, in order:**
-{{COMMANDS}}
+1. Read the spec's M7 section, FR-5/6/7, section 9 (SSRF, Tampering, Repudiation), and the contract's `WebhookSubscription*`, `DeadLetter*` and event schemas.
+2. Wrote `signing.py` and `ssrf.py` first, with their unit tests. The published Standard Webhooks vector reproduces exactly: `sign("whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw", "msg_p5jXN8AQM9LWM0D4loKWxJek", 1614265330, b'{"test": 2432232314}')` → `v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE=`.
+3. Wrote the migration, the outbox, the poller changes and the APIs, then ran `make migrate-local` → `applied 1 migration(s): 0003_webhooks`.
+4. Ran `make certs` (the lab CA and the sink certificate), then `make mocks`. "What broke" 1 happened here.
+5. Wrote the dispatcher and its tests, then ran `make check` → **318 passed**, ruff and mypy clean.
+6. Started three processes in the background: `make api-local`, `make poll-local` and `make dispatch-local`.
+7. Set up the sink:
+   - created an ACME subscription with `POST /v1/webhook-subscriptions` (`https://localhost:9000/webhooks/acme`, `shipment.created` + `shipment.status_changed`);
+   - stored the returned secret in the scratchpad, never printed;
+   - gave it to the sink with `POST /__secrets`.
+8. **Phase 1, signatures:** dropped two generated files (300 rows, then the same shipments re-exported with new statuses).
+9. **Phase 2, a 10-minute outage:**
+   - `docker compose stop -t 2 webhook-sink` at 20:21:03;
+   - dropped `SHPSTS_20260926_2030.csv` (12 new shipments);
+   - let the dispatcher retry for about 9.5 minutes.
+10. **Phase 3, max age and replay:** the sink was still down, so:
+    - stopped the dispatcher by PID and restarted it with `WEBHOOK_MAX_AGE=120s make dispatch-local`;
+    - dropped `SHPSTS_20260926_2035.csv` (12 more) and waited for the dead letters;
+    - `docker compose start webhook-sink` at 20:34:12, then gave the sink the secret again ("What broke" 5);
+    - `GET /v1/dead-letters?kind=webhook&resolved=false`, then `POST …:replay` for each dead letter with the ops key.
+11. Waited for the outage's last two deliveries to reach their scheduled retries, then stopped the API, poller and dispatcher by PID. Added the `SKIP LOCKED` test ("What broke" 3), then ran `make check` again.
 
 **Verification:**
-{{VERIFICATION}}
+The spec's four "Done when" clauses, one at a time. All times are UTC.
+
+**1. The sink verifies 100% of signatures.** Phase 1: 294 new shipments (+ 6 bad rows dead-lettered), then 100 status changes. Of those, ACME's share became deliveries:
+
+```text
+shipment.created|delivered|105
+shipment.status_changed|delivered|23
+=== SPEC GATE: docker compose logs webhook-sink --since 15m | grep -c "signature=valid"
+132
+--- dispatcher deliveries (UUID webhook-id):
+    128 signature=valid
+--- M2 sink tests (msg_ ids):
+      6 signature=invalid        <- the M2 tests' deliberate forgeries
+      4 signature=valid
+--- db delivered: 128
+```
+
+The spec's grep says 132, but that count includes the M2 sink tests' own traffic ("What broke" 2). Counting only the dispatcher's deliveries: 128 of 128 valid, 0 invalid, matching the 128 `delivered` rows. After phases 2 and 3, every further dispatcher delivery was also `signature=valid` (below).
+
+**2. Stopping the sink for 10 minutes shows growing, jittered retry gaps.** This is from `dispatch.log`, per delivery: the attempt number, when it ran, and the drawn wait against its cap (`30 s × 2^(n-1)`):
+
+```text
+44a9b0b65329 #1@20:21:07 wait 21.5s(cap 30)  #2@20:21:30 wait 8.5s(cap 60)  #3@20:21:39 wait 109.8s(cap 120)  #4@20:23:30 wait 35.4s(cap 240)  #5@20:24:05 wait 201.2s(cap 480)  #6@20:27:27 wait 898.7s(cap 960)
+018fe1857d5d #1@20:21:07 wait 0.7s(cap 30)   #2@20:21:08 wait 38.6s(cap 60)  #3@20:21:47 wait 89.3s(cap 120)   #4@20:23:16 wait 238.3s(cap 240) #5@20:27:15 wait 70.2s(cap 480)  #6@20:28:26 wait 737.7s(cap 960)
+36fc87af5030 #1@20:21:07 wait 17.2s(cap 30)  #2@20:21:25 wait 1.2s(cap 60)  #3@20:21:27 wait 118.3s(cap 120)  #4@20:23:26 wait 120.1s(cap 240) #5@20:25:26 wait 295.9s(cap 480) #6@20:30:23 wait 163.4s(cap 960)
+8680c5b06687 #1@20:21:07 wait 22.9s(cap 30)  #2@20:21:31 wait 10.7s(cap 60)  #3@20:21:42 wait 42.8s(cap 120)  #4@20:22:26 wait 79.1s(cap 240)  #5@20:23:45 wait 276.0s(cap 480) #6@20:28:21 wait 198.7s(cap 960)
+attempt 1: n=5 min=0.7s   max=22.9s  cap=30s
+attempt 2: n=5 min=1.2s   max=38.6s  cap=60s
+attempt 3: n=5 min=42.8s  max=118.3s cap=120s
+attempt 4: n=5 min=35.4s  max=238.3s cap=240s
+attempt 5: n=5 min=60.2s  max=295.9s cap=480s
+attempt 6: n=5 min=163.4s max=898.7s cap=960s
+```
+
+- **Growing:** the ceiling doubles, and the largest gap per attempt number grows from 22.9 s to 898.7 s.
+- **Jittered:** all five deliveries failed together at 20:21:07, and by attempt 3 they were spread over 20 seconds. Individual gaps can *shrink* (70.2 s after 238.3 s), which is what full jitter looks like. That spread is the point: a recovering shipper isn't hit by a synchronised wave.
+
+**3. With `WEBHOOK_MAX_AGE=120s`, the row lands in `dead_letters`.** Five deliveries dead-lettered: two outage rows (already older than 120 s, at their 7th attempt) and all three new ones (after 4–5 attempts):
+
+```text
+20:31:40 delivery=…8680c5b06687 event=shipment.created -> dead-lettered after 7 attempts (ConnectError)
+20:33:18 delivery=…33c3c8947667 event=shipment.created -> dead-lettered after 4 attempts (ConnectError)
+$ curl -s 'localhost:8000/v1/dead-letters?kind=webhook&resolved=false' -H 'X-API-Key: dev-ops-key'
+5 open webhook dead letters
+{ "kind": "webhook", "reason": "max age 120s exceeded (last: ConnectError)",
+  "source": {"subscription_id": "1026be46-…", "event_type": "shipment.created", "attempts": 5},
+  "resolved": false, "replay_count": 0, ... }
+```
+
+**4. A replay delivers it once the sink is back.** Five replays → `202 queued`. A second replay of the first → `409 already-resolved`, because by then it had been delivered:
+
+```text
+ dead_letter_id                       | status    | attempts | last_result | resolved | replay_count
+ 01a0df6a-9a34-7add-acfb-9c6ab78656c5 | delivered |        1 | HTTP 200    | t        |            1
+ ... (5 of 5 the same)
+ ops_client_id | outcome          | count        <- dead_letter_replays: every attempt audited
+ meridian-ops  | queued           |     5
+ meridian-ops  | already_resolved |     1
+webhook-sink delivery id=01a0df60-…-8680c5b06687 path=/acme signature=valid answered=200
+... (5 of 5 signature=valid, same webhook-id as the original attempts)
+```
+
+{{P2TAIL}}
 
 **Mutation check** (each applied, run, then restored):
 
@@ -918,7 +1000,7 @@ The security reviewer confirmed tenant isolation: there was no cross-shipper rep
    - Correctness comes from the lease; `SKIP LOCKED` is what stops replicas **queueing behind each other**.
    - The new test holds one claim open and requires a second dispatcher to take the other rows within 2 s. The mutant now times out.
 4. *The second generated file had `rows_dead=200`.* `make_export` re-randomises `SHIPPER_CODE` per call, so re-exporting the same shipments "moved" two thirds of them to other shippers. The owner-change refusal (M3) dead-lettered them, exactly as designed. That's a test-data artifact, not a bug.
-{{BROKE}}
+5. *A restarted sink forgets its secret.* The lab sink keeps its accepted secrets in memory (`POST /__secrets`), so after `docker compose start` it would answer `400` (signature invalid) to everything. That's just more retries for the dispatcher, but it would have muddied the gate. I set the secret again right after the restart, before any delivery was due. A real receiver keeps its secret in its own secret store.
 
 **Known limits:**
 - **Secrets are stored in plaintext** (difference 39). They have to be: HMAC needs the key itself. Production wraps them with a KMS key.
