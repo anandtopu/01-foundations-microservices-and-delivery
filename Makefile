@@ -40,6 +40,7 @@ contract-lint:  ## (M1) Lint the OpenAPI 3.1 contract
 keys:  ## (M2) Generate the gateway SFTP key into secrets/ (skips if present)
 	@mkdir -p secrets && chmod 700 secrets
 	@test -f secrets/gateway_ed25519 || ssh-keygen -t ed25519 -N "" -C gateway@meridian-lab -f secrets/gateway_ed25519
+	@chown 10001:10001 secrets/gateway_ed25519 2>/dev/null || true  # (M8) the poller runs as uid 10001
 	cp secrets/gateway_ed25519.pub mocks/sftp/gateway_ed25519.pub
 
 # Docker Hub allows 100 anonymous pulls/h per egress IP, and the cloud VM shares its IP, so we hit 429.

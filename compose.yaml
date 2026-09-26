@@ -1,4 +1,5 @@
-# P01 lab topology. M2: Postgres + the three legacy stand-ins. M8 adds gateway-api, sftp-poller and webhook-dispatcher.
+# P01 lab topology. M2: Postgres + the three legacy stand-ins. M8: gateway-api, sftp-poller and
+# webhook-dispatcher, all from ONE image (meridian-gateway) with different commands.
 # The project name scopes every container, network and volume, so `docker compose down -v` touches only this lab.
 name: meridian
 
@@ -73,7 +74,73 @@ services:
       timeout: 3s
       retries: 20
 
+  # --- the gateway (M8): one image, three processes ------------------------------------------------
+  gateway-api:
+    build:
+      context: .
+      secrets: [build_ca]
+    image: meridian-gateway:latest
+    environment: &gateway-env
+      DATABASE_URL: postgresql://${POSTGRES_USER:-gateway}:${POSTGRES_PASSWORD:-gateway}@postgres:5432/${POSTGRES_DB:-gateway}
+      SOAP_BASE_URL: http://soap-mock:8080
+      SFTP_HOST: sftp
+      SFTP_PORT: "22"
+      WEBHOOK_MAX_AGE: ${WEBHOOK_MAX_AGE:-72h}
+      # LAB ONLY (ARCHITECTURE differences 37/38): the sink is on the Compose network, and its
+      # certificate comes from the lab CA. Production leaves both unset.
+      WEBHOOK_DEV_ALLOW_HOSTS: webhook-sink
+      WEBHOOK_CA_BUNDLE: /run/secrets/webhook_ca
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres: { condition: service_healthy }
+      sftp: { condition: service_healthy }
+      soap-mock: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    <<: &hardening
+      read_only: true                     # nothing writes to the image's filesystem
+      tmpfs: [/tmp]
+      cap_drop: [ALL]
+      security_opt: ["no-new-privileges:true"]
+      restart: unless-stopped
+
+  sftp-poller:
+    image: meridian-gateway:latest
+    command: ["python", "-m", "gateway.ingest.poller"]
+    environment:
+      <<: *gateway-env
+      SFTP_POLL_INTERVAL_S: ${SFTP_POLL_INTERVAL_S:-60}
+    # Only the poller holds the SFTP key; the API's readiness probe needs no credentials.
+    secrets: [gateway_ed25519, known_hosts]
+    depends_on:
+      postgres: { condition: service_healthy }
+      sftp: { condition: service_healthy }
+      gateway-api: { condition: service_healthy }   # the image exists and migrations ran
+    <<: *hardening
+
+  webhook-dispatcher:
+    image: meridian-gateway:latest
+    command: ["python", "-m", "gateway.webhooks.dispatcher"]
+    environment: *gateway-env
+    secrets: [webhook_ca]
+    depends_on:
+      postgres: { condition: service_healthy }
+      gateway-api: { condition: service_healthy }
+    <<: *hardening
+
 secrets:
+  # Runtime secrets (gitignored secrets/, created by `make keys` / `make certs` / `make pin-hostkey`).
+  # Compose mounts them read-only at /run/secrets/<name>; the key is chowned to uid 10001 by make keys.
+  gateway_ed25519:
+    file: ./secrets/gateway_ed25519
+  known_hosts:
+    file: ./secrets/known_hosts
+  webhook_ca:
+    file: ./secrets/webhook-ca.crt
   # Optional CA bundle for a TLS-inspecting egress proxy, used ONLY at image build time (see mocks/Dockerfile.python).
   # Set BUILD_CA_BUNDLE in .env on the cloud VM; elsewhere it defaults to an empty file.
   build_ca:

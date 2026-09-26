@@ -1,0 +1,9 @@
+# Build context for the gateway image: only pyproject.toml, uv.lock, src/ and migrations/
+# are used. Keep secrets and local state out of the context entirely (they would otherwise be sent
+# to the daemon, and one COPY . would bake them into a layer).
+*
+!pyproject.toml
+!uv.lock
+!src/
+!migrations/
+**/__pycache__

@@ -1,0 +1,123 @@
+{
+  "operation": "POST /v1/rate-quotes",
+  "method": "POST",
+  "path_template": "/v1/rate-quotes",
+  "fingerprint": "10af044e",
+  "case_id": "91dIoK",
+  "code_sample": "curl -X POST -H 'X-API-Key: [Filtered]' -H 'Idempotency-Key: [Filtered]' -H 'Content-Type: application/json' -d '{\"origin_zip\": \"40179\", \"weight_lb\": 45000.0, \"dest_zip\": \"40179\", \"service_level\": \"FTL\"}' http://localhost:8000/v1/rate-quotes",
+  "sequence": [
+    {
+      "method": "POST",
+      "url": "http://localhost:8000/v1/rate-quotes",
+      "url_template": "http://localhost:8000/v1/rate-quotes",
+      "headers": {
+        "User-Agent": "schemathesis/4.28.0",
+        "Accept-Encoding": "gzip, deflate, zstd",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "X-API-Key": "[Filtered]",
+        "Idempotency-Key": "[Filtered]",
+        "X-Schemathesis-TestCaseId": "91dIoK",
+        "Content-Type": "application/json",
+        "Content-Length": "90"
+      },
+      "response": {
+        "status_code": 422,
+        "headers": {
+          "date": "Sat, 26 Sep 2026 22:13:30 GMT",
+          "content-length": "131",
+          "content-type": "application/problem+json"
+        },
+        "body": "{\"type\":\"https://errors.meridian-gateway.example/idempotency-key-reused\",\"title\":\"Key was used with a different body\",\"status\":422}"
+      },
+      "link": null,
+      "checks": [
+        {
+          "name": "positive_data_acceptance",
+          "status": "failure",
+          "message": "API rejected schema-compliant request\n\nValid data should have been accepted\nExpected: 2xx, 401, 403, 404, 409, 429, 5xx"
+        }
+      ],
+      "meta": {
+        "generation": {
+          "time": 0.004325650999987829,
+          "mode": "positive"
+        },
+        "components": {
+          "HEADER": "positive",
+          "BODY": "positive"
+        },
+        "phase": {
+          "name": "stateful",
+          "data": {
+            "type": "StatefulPhaseData",
+            "description": "Positive test case",
+            "location": null,
+            "parameter": null,
+            "parameter_location": null,
+            "mutations": []
+          }
+        },
+        "pool_draws": [],
+        "pool_misses": [],
+        "semantic_draws": [
+          {
+            "path": [
+              "origin_zip"
+            ],
+            "type_token": "string",
+            "format_token": null,
+            "pattern_hash": "a94dc58b9acb2fdd",
+            "normalized_name": "originzip",
+            "value": "40179",
+            "source_operation": "POST /v1/rate-quotes"
+          },
+          {
+            "path": [
+              "dest_zip"
+            ],
+            "type_token": "string",
+            "format_token": null,
+            "pattern_hash": "a94dc58b9acb2fdd",
+            "normalized_name": "destzip",
+            "value": "40179",
+            "source_operation": "POST /v1/rate-quotes"
+          },
+          {
+            "path": [
+              "weight_lb"
+            ],
+            "type_token": "number",
+            "format_token": null,
+            "pattern_hash": null,
+            "normalized_name": "weightlb",
+            "value": 45000.0,
+            "source_operation": "POST /v1/rate-quotes"
+          }
+        ],
+        "dictionary_draws": [],
+        "constants_draws": [],
+        "raw_containers": {}
+      },
+      "path": "/v1/rate-quotes",
+      "path_parameters": {},
+      "query": {},
+      "case_headers": {
+        "X-API-Key": "[Filtered]",
+        "Idempotency-Key": "[Filtered]"
+      },
+      "cookies": {},
+      "case_body": {
+        "encoding": "json",
+        "value": {
+          "origin_zip": "40179",
+          "weight_lb": 45000.0,
+          "dest_zip": "40179",
+          "service_level": "FTL"
+        }
+      },
+      "media_type": "application/json",
+      "parent_index": null
+    }
+  ]
+}

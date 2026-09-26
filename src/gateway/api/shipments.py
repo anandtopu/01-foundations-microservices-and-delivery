@@ -1,0 +1,119 @@
+"""Shipment status for shippers (FR-3): GET /v1/shipments and GET /v1/shipments/{shipment_id}.
+
+Every read is filtered by the caller's client_id IN THE QUERY (section 9, BOLA): another shipper's
+shipment is "not found", with the same body as one that does not exist.
+
+The list is keyset-paginated on (updated_at, shipment_id), served by the index
+shipments_client_page (client_id, updated_at, shipment_id). A keyset cursor stays correct while the
+poller keeps writing: an OFFSET would skip or repeat rows as updates move them. A shipment that is
+updated while you page through moves to the end and is seen again: that is the point of an
+"updated since" feed, and clients de-duplicate on shipment_id.
+"""
+
+import base64
+import binascii
+import json
+from datetime import datetime
+from typing import Annotated, Any
+
+from fastapi import APIRouter, Depends, Path, Query, Request
+from psycopg_pool import AsyncConnectionPool
+from pydantic import AwareDatetime
+
+from gateway.auth import Principal, shipper_principal
+from gateway.errors import ProblemError
+
+Caller = Annotated[Principal, Depends(shipper_principal)]
+router = APIRouter()
+
+SHIPMENT_ID = r"^[A-Za-z0-9][A-Za-z0-9-]*$"  # contract ShipmentId
+COLUMNS = "shipment_id, order_no, status, ship_date, weight_lb, updated_at"
+
+
+def view(row: tuple[Any, ...]) -> dict[str, object]:
+    shipment_id, order_no, status, ship_date, weight_lb, updated_at = row
+    return {
+        "shipment_id": shipment_id,
+        "order_no": order_no,
+        "status": status,
+        "ship_date": ship_date.isoformat(),
+        "weight_lb": str(weight_lb),  # numeric(12,2) -> "1260.50": no float rounding (contract)
+        "updated_at": updated_at.isoformat(),
+    }
+
+
+def encode_cursor(updated_at: str, shipment_id: str, since: str | None) -> str:
+    blob = json.dumps({"u": updated_at, "i": shipment_id, "f": since}, sort_keys=True)
+    return base64.urlsafe_b64encode(blob.encode()).decode().rstrip("=")
+
+
+def decode_cursor(cursor: str, since: str | None) -> tuple[datetime, str]:
+    """Opaque to clients, bound to the filter it was issued for, and fully type-checked: a
+    tampered cursor is a 400, never a 500 (the lesson of the PR #5 review)."""
+    try:
+        blob = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+        if not isinstance(blob, dict) or blob.get("f") != since:
+            raise ValueError("cursor issued for another filter")
+        at, shipment_id = blob["u"], blob["i"]
+        if not (isinstance(at, str) and isinstance(shipment_id, str)):
+            raise ValueError("wrong types")
+        parsed = datetime.fromisoformat(at)
+        if parsed.tzinfo is None:
+            raise ValueError("naive timestamp")
+        return parsed, shipment_id
+    except (ValueError, KeyError, TypeError, binascii.Error, UnicodeDecodeError) as exc:
+        raise ProblemError(
+            400, "invalid-cursor", "Invalid cursor", "Use a next_cursor from this same query."
+        ) from exc
+
+
+@router.get("/v1/shipments")
+async def list_shipments(
+    request: Request,
+    who: Caller,
+    updated_since: AwareDatetime | None = None,
+    cursor: Annotated[str | None, Query(min_length=1, max_length=512)] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> dict[str, object]:
+    since = updated_since.isoformat() if updated_since else None
+    after = decode_cursor(cursor, since) if cursor else (None, None)
+    pool: AsyncConnectionPool = request.app.state.db
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            f"""SELECT {COLUMNS} FROM shipments
+                 WHERE client_id = %(client)s
+                   AND (%(since)s::timestamptz IS NULL OR updated_at >= %(since)s)
+                   AND (%(u)s::timestamptz IS NULL
+                        OR (updated_at, shipment_id) > (%(u)s, %(i)s::text))
+                 ORDER BY updated_at, shipment_id
+                 LIMIT %(n)s""",  # noqa: S608 - COLUMNS is a constant, values are parameters
+            {"client": who.client_id, "since": updated_since, "u": after[0], "i": after[1],
+             "n": limit + 1},
+        )  # fmt: skip
+        rows = await cur.fetchall()
+    page = [view(r) for r in rows[:limit]]
+    last = page[-1] if page else None
+    next_cursor = (
+        encode_cursor(str(last["updated_at"]), str(last["shipment_id"]), since)
+        if len(rows) > limit and last
+        else None
+    )
+    return {"data": page, "next_cursor": next_cursor}
+
+
+@router.get("/v1/shipments/{shipment_id}")
+async def get_shipment(
+    request: Request,
+    who: Caller,
+    shipment_id: Annotated[str, Path(min_length=1, max_length=32, pattern=SHIPMENT_ID)],
+) -> dict[str, object]:
+    pool: AsyncConnectionPool = request.app.state.db
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            f"SELECT {COLUMNS} FROM shipments WHERE shipment_id = %s AND client_id = %s",  # noqa: S608
+            (shipment_id, who.client_id),
+        )
+        row = await cur.fetchone()
+    if row is None:  # another shipper's shipment is "not found" (BOLA)
+        raise ProblemError(404, "not-found", "Not found", "No such shipment for this API key.")
+    return view(row)
