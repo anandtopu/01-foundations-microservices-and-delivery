@@ -904,7 +904,7 @@ The security reviewer confirmed tenant isolation: there was no cross-shipper rep
     - dropped `SHPSTS_20260926_2035.csv` (12 more) and waited for the dead letters;
     - `docker compose start webhook-sink` at 20:34:12, then gave the sink the secret again ("What broke" 5);
     - `GET /v1/dead-letters?kind=webhook&resolved=false`, then `POST …:replay` for each dead letter with the ops key.
-11. Waited for the outage's last two deliveries to reach their scheduled retries, then stopped the API, poller and dispatcher by PID. Added the `SKIP LOCKED` test ("What broke" 3), then ran `make check` again.
+11. Waited for the outage's last two deliveries to reach their scheduled retries, then stopped the API, poller and dispatcher by PID. Added the `SKIP LOCKED` test ("What broke" 3), then ran `make check` again → **319 passed**, ruff and mypy clean. Port 8000 is closed.
 
 **Verification:**
 The spec's four "Done when" clauses, one at a time. All times are UTC.
@@ -969,7 +969,15 @@ webhook-sink delivery id=01a0df60-…-8680c5b06687 path=/acme signature=valid an
 ... (5 of 5 signature=valid, same webhook-id as the original attempts)
 ```
 
-{{P2TAIL}}
+**And the outage deliveries that were *not* dead-lettered recovered by themselves.** Their long scheduled retries came due after the sink was back, and each was delivered on its 7th or 8th attempt with no replay:
+
+```text
+ d81256da652f | delivered | 8 | HTTP 200 | 20:34:39
+ 018fe1857d5d | delivered | 7 | HTTP 200 | 20:40:45
+ 44a9b0b65329 | delivered | 7 | HTTP 200 | 20:42:27
+```
+
+**Totals at the end:** `webhook_deliveries` holds 136 `delivered` rows, and nothing pending, dead or cancelled. The sink logged **136 `signature=valid` and 0 invalid** for dispatcher (UUID) `webhook-id`s. That's 100%, and it matches the database one for one.
 
 **Mutation check** (each applied, run, then restored):
 
