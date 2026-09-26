@@ -8,10 +8,8 @@
 // Expected mix under this burst: some 201s, many fast 503s (Retry-After) once the 4 slots are busy.
 import http from "k6/http";
 import { check } from "k6";
-import { Counter } from "k6/metrics";
 
 const BASE_URL = __ENV.BASE_URL || "http://localhost:8000";
-const byStatus = new Counter("quotes_by_status");
 
 export const options = {
   scenarios: {
@@ -22,6 +20,10 @@ export const options = {
     checks: ["rate==1.0"],
     // Shedding must be fast: a 503 that took seconds would still tie up the shipper.
     "http_req_duration{status:503}": ["p(95)<500"],
+    // Both outcomes must actually happen, or the burst proved nothing (a run with zero 503s would
+    // pass the latency threshold vacuously). These also print the 201/503 split in the summary.
+    "http_reqs{status:201}": ["count>0"],
+    "http_reqs{status:503}": ["count>0"],
   },
 };
 
@@ -40,9 +42,10 @@ export default function () {
       tags: { name: "POST /v1/rate-quotes" },
     },
   );
-  byStatus.add(1, { status: String(res.status) });
   check(res, {
     "201 or 503": (r) => r.status === 201 || r.status === 503,
-    "503 carries Retry-After": (r) => r.status !== 503 || r.headers["Retry-After"] !== undefined,
+    // RFC 9110 delay-seconds: a positive whole number, never 0 or a date.
+    "503 carries Retry-After >= 1": (r) =>
+      r.status !== 503 || /^[1-9][0-9]*$/.test(r.headers["Retry-After"] || ""),
   });
 }

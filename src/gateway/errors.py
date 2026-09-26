@@ -6,10 +6,14 @@ upstream internals (Meridian's faultstring is logged, not returned).
 """
 
 import logging
+import uuid
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.datastructures import Headers
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from gateway.resilience import (
     BulkheadFull,
@@ -17,7 +21,7 @@ from gateway.resilience import (
     RetryableError,
     retry_after_seconds,
 )
-from gateway.soap.client import UpstreamRejected
+from gateway.soap.client import UpstreamInvalidResponse, UpstreamRejected
 
 log = logging.getLogger("gateway.errors")
 
@@ -26,6 +30,9 @@ PROBLEM = "application/problem+json"
 
 # ADR-P01-1: "shippers see 503 Retry-After: 2 at peak instead of a dead upstream".
 SATURATED_RETRY_AFTER_S = 2
+MAX_BODY_BYTES = 64 * 1024  # spec section 9: 64 KB request body limit
+MAX_REPORTED_ERRORS = 20  # a hostile body with 200,000 bad keys must not get a 22 MB 422 back
+_HTTP_SLUGS = {404: "not-found", 405: "method-not-allowed", 413: "payload-too-large"}
 
 
 class ProblemError(Exception):
@@ -62,6 +69,66 @@ def problem(
     return JSONResponse(body, status_code=status, media_type=PROBLEM, headers=headers)
 
 
+def pointer(loc: tuple[int | str, ...]) -> str:
+    """('body', 'a/b') -> '/body/a~1b' (RFC 6901 escaping)."""
+    return "".join("/" + str(p).replace("~", "~0").replace("/", "~1") for p in loc)
+
+
+class RequestGuard:
+    """ASGI middleware, before any route: 413 for bodies over MAX_BODY_BYTES (counted even when
+    there is no Content-Length, i.e. chunked uploads) and 415 for a non-empty body that is not
+    application/json. Both answer with Problem Details (PR #3 review)."""
+
+    def __init__(self, app: ASGIApp, max_body: int = MAX_BODY_BYTES) -> None:
+        self.app, self.max_body = app, max_body
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope["method"] not in {"POST", "PUT", "PATCH"}:
+            await self.app(scope, receive, send)
+            return
+        headers = Headers(scope=scope)
+        length = headers.get("content-length")
+        if length is not None and (not length.isdigit() or int(length) > self.max_body):
+            await self._too_large(scope, receive, send)
+            return
+        body = bytearray()
+        more = True
+        while more:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            body += message.get("body", b"")
+            more = message.get("more_body", False)
+            if len(body) > self.max_body:
+                await self._too_large(scope, receive, send)
+                return
+        media_type = headers.get("content-type", "").split(";")[0].strip().lower()
+        if body and media_type != "application/json":
+            response = problem(
+                415,
+                "unsupported-media-type",
+                "Unsupported media type",
+                "Send the request body as application/json.",
+            )
+            await response(scope, receive, send)
+            return
+        replayed = False
+
+        async def replay() -> Message:
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {"type": "http.request", "body": bytes(body), "more_body": False}
+            return await receive()
+
+        await self.app(scope, replay, send)
+
+    async def _too_large(self, scope: Scope, receive: Receive, send: Send) -> None:
+        detail = f"The request body must be at most {self.max_body} bytes."
+        response = problem(413, "payload-too-large", "Payload too large", detail)
+        await response(scope, receive, send)
+
+
 def install(app: FastAPI) -> None:
     """Register the exception handlers on the app."""
 
@@ -69,17 +136,37 @@ def install(app: FastAPI) -> None:
     async def _problem(_: Request, exc: ProblemError) -> JSONResponse:
         return problem(exc.status, exc.slug, exc.title, exc.detail, retry_after=exc.retry_after)
 
+    app.add_middleware(RequestGuard)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _http(_: Request, exc: StarletteHTTPException) -> JSONResponse:
+        # Routing errors (404, 405) must be Problem Details too (FR-8: every error).
+        response = problem(
+            exc.status_code,
+            _HTTP_SLUGS.get(exc.status_code, f"http-{exc.status_code}"),
+            str(exc.detail),
+        )
+        response.headers.update(exc.headers or {})  # keeps e.g. 405's Allow header
+        return response
+
     @app.exception_handler(RequestValidationError)
     async def _validation(_: Request, exc: RequestValidationError) -> JSONResponse:
+        found = exc.errors()
+        if any(e["type"] == "json_invalid" for e in found):
+            return problem(
+                400, "malformed-json", "Malformed request", "The body is not valid JSON."
+            )
+        # Messages and locations only: FastAPI's `input` would echo the shipper's values back.
         errors = [
-            {"location": "/" + "/".join(str(p) for p in e["loc"]), "message": e["msg"]}
-            for e in exc.errors()
+            {"location": pointer(tuple(e["loc"]))[:200], "message": str(e["msg"])[:200]}
+            for e in found[:MAX_REPORTED_ERRORS]
         ]
         return problem(
             422,
             "validation-failed",
             "Request validation failed",
-            f"{len(errors)} problem(s) in the request",
+            f"{len(found)} problem(s) in the request"
+            + (f"; the first {MAX_REPORTED_ERRORS} are listed" if len(found) > len(errors) else ""),
             extra={"errors": errors},
         )
 
@@ -125,7 +212,20 @@ def install(app: FastAPI) -> None:
             "weight and service level; retrying the same request will fail the same way.",
         )
 
+    @app.exception_handler(UpstreamInvalidResponse)
+    async def _invalid(_: Request, exc: UpstreamInvalidResponse) -> JSONResponse:
+        log.error("upstream returned unusable data: %s", exc)
+        return problem(
+            502,
+            "upstream-invalid-response",
+            "Rate service returned an unusable quote",
+            "Meridian's rate service answered with data we cannot pass on. This is not a problem "
+            "with your request; try again later.",
+        )
+
     @app.exception_handler(Exception)
     async def _internal(_: Request, exc: Exception) -> JSONResponse:
-        log.exception("unhandled error")
-        return problem(500, "internal-error", "Internal server error")
+        # instance ties the shipper's support ticket to this log line (contract: InternalError).
+        instance = f"urn:uuid:{uuid.uuid4()}"
+        log.exception("unhandled error instance=%s", instance)
+        return problem(500, "internal-error", "Internal server error", extra={"instance": instance})

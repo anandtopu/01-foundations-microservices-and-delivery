@@ -44,6 +44,11 @@ class UpstreamRejected(Exception):
     """SOAP Client fault: our request was wrong. Never retried."""
 
 
+class UpstreamInvalidResponse(Exception):
+    """lab: Meridian answered "success" with data that breaks our contract (e.g. TotalCharge "1e3").
+    Not the shipper's fault and not retried automatically (PR #3 review)."""
+
+
 class QuoteInput(Protocol):  # lab: what the adapter needs; RateQuoteRequest satisfies it
     @property
     def origin_zip(self) -> str: ...

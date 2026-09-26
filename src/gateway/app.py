@@ -36,8 +36,11 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
         title="Meridian Legacy Integration Gateway",
         version="0.1.0",
         lifespan=lifespan,
-        docs_url=None,  # the design-first contract is contracts/openapi.yaml (ADR-P01-4)
+        # The design-first contract is contracts/openapi.yaml (ADR-P01-4). FastAPI's generated
+        # schema differs from it, so do not publish one at all (PR #3 review).
+        docs_url=None,
         redoc_url=None,
+        openapi_url=None,
     )
     errors.install(app)
     app.include_router(rate_quotes.router)

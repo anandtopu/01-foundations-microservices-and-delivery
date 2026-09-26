@@ -4,7 +4,6 @@ The breaker reads time.monotonic(); a fake clock makes "30 s later" instant and 
 """
 
 import asyncio
-import time
 from collections.abc import Callable
 from types import SimpleNamespace
 
@@ -169,6 +168,73 @@ async def test_cancelled_trial_does_not_wedge_half_open(clock: Clock) -> None:
     assert breaker.state is State.CLOSED
 
 
+async def test_late_success_from_before_the_open_does_not_close_it(clock: Clock) -> None:
+    """PR #3 review: a call admitted while CLOSED that succeeds after the breaker opened used to
+    close it at once, skipping the cool-down and the single half-open trial."""
+    breaker = CircuitBreaker(failure_threshold=5, reset_after=30)
+    gate = asyncio.Event()
+
+    async def slow_ok() -> str:
+        await gate.wait()
+        return "ok"
+
+    early = asyncio.create_task(breaker.call(slow_ok))
+    await asyncio.sleep(0)
+    await fail(breaker, 5)
+    assert breaker.state is State.OPEN
+    gate.set()
+    assert await early == "ok"  # the caller still gets its result...
+    assert (breaker.state, breaker.failures) == (State.OPEN, 5)  # ...but the breaker stays open
+
+
+async def test_late_failures_do_not_extend_the_open_window(clock: Clock) -> None:
+    breaker = CircuitBreaker(failure_threshold=1, reset_after=30)
+    gate = asyncio.Event()
+
+    async def slow_busy() -> str:
+        await gate.wait()
+        raise RetryableError("busy")
+
+    late = asyncio.create_task(breaker.call(slow_busy))
+    await asyncio.sleep(0)
+    await fail(breaker, 1)
+    opened_at = breaker.opened_at
+    clock.now += 10
+    gate.set()
+    with pytest.raises(RetryableError):
+        await late
+    assert breaker.opened_at == opened_at  # not pushed back by a stale result
+
+
+async def test_a_stale_call_cannot_clear_the_trial_flag(clock: Clock) -> None:
+    """PR #3 review: any finishing call used to reset _trial, admitting a second trial."""
+    breaker = CircuitBreaker(failure_threshold=1, reset_after=30)
+    old_gate, trial_gate = asyncio.Event(), asyncio.Event()
+
+    async def old_busy() -> str:
+        await old_gate.wait()
+        raise RetryableError("busy")
+
+    async def trial_op() -> str:
+        await trial_gate.wait()
+        return "ok"
+
+    old = asyncio.create_task(breaker.call(old_busy))  # admitted while CLOSED
+    await asyncio.sleep(0)
+    await fail(breaker, 1)
+    clock.now += 30
+    trial = asyncio.create_task(breaker.call(trial_op))  # the one half-open trial
+    await asyncio.sleep(0)
+    old_gate.set()
+    with pytest.raises(RetryableError):
+        await old  # the stale call finishes while the trial is still running
+    with pytest.raises(CircuitOpenError, match="trial in flight"):
+        await breaker.call(ok)  # still exactly one trial
+    trial_gate.set()
+    assert await trial == "ok"
+    assert breaker.state is State.CLOSED
+
+
 # --- full-jitter retry -------------------------------------------------------------------------
 
 
@@ -230,21 +296,52 @@ async def test_retry_stops_when_the_next_sleep_would_pass_the_deadline(
         calls += 1
         raise RetryableError("busy")
 
-    start = time.perf_counter()
     with pytest.raises(RetryableError):
         await retry_full_jitter(always_busy, attempts=10, base=0.2, cap=2.0, deadline=0.5)
     # sleeps 0.2 (t=0.2), then 0.4 would end at 0.6 > 0.5: give up after 2 calls, not 10
     assert calls == 2
-    assert time.perf_counter() - start < 0.45
 
 
-@pytest.mark.parametrize("seed", range(5))
-async def test_jitter_really_is_random(seed: int) -> None:
-    # Many clients retrying at the same instant must spread out, not stampede together.
-    resilience.random.seed(seed)
-    delays = {resilience.random.uniform(0, min(2.0, 0.2 * 2**1)) for _ in range(50)}
-    assert len(delays) == 50
-    assert all(0 <= d <= 0.4 for d in delays)
+async def test_retry_delays_are_spread_not_synchronised(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Runs OUR retry loop (PR #3 review: the old test only exercised random.uniform). 200 clients
+    that fail at the same instant must not all come back at the same instant."""
+    first_delays: list[float] = []
+
+    async def record(delay: float) -> None:
+        first_delays.append(delay)
+        raise asyncio.CancelledError  # stop after the first backoff; we only need the delay
+
+    monkeypatch.setattr(resilience.asyncio, "sleep", record)
+    for _ in range(200):
+        with pytest.raises(asyncio.CancelledError):
+            await retry_full_jitter(busy, attempts=3, base=0.2, cap=2.0)
+    assert all(0 <= d <= 0.2 for d in first_delays)  # [0, min(cap, base * 2^0)]
+    assert len(set(first_delays)) == 200  # all different: no synchronised herd
+    assert max(first_delays) - min(first_delays) > 0.15  # and spread across the window
+
+
+def test_attempts_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="attempts must be >= 1"):
+        asyncio.run(retry_full_jitter(ok, attempts=0))
+
+
+async def test_the_deadline_also_bounds_a_running_attempt() -> None:
+    """PR #3 review: the spec checked the deadline only before sleeping, so a slow attempt could
+    run far past it while holding a bulkhead slot."""
+    calls = 0
+
+    async def hangs() -> str:
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(10)
+        return "late"
+
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    with pytest.raises(RetryableError, match=r"budget of 0\.2 s used up"):
+        await retry_full_jitter(hangs, attempts=3, deadline=0.2)
+    assert calls == 1
+    assert loop.time() - start < 5  # generous: the point is "not 10 s", not a timing benchmark
 
 
 async def test_open_breaker_ends_the_retries_immediately(clock: Clock) -> None:
@@ -356,11 +453,9 @@ async def test_spec_gate_logic_breaker_opens_on_the_second_call(
         await svc.quote(Q)
     assert (calls, svc.breaker.state) == (5, State.OPEN)
 
-    start = time.perf_counter()
     with pytest.raises(CircuitOpenError):
         await svc.quote(Q)
-    assert calls == 5
-    assert time.perf_counter() - start < 0.01  # "every later call returns 503 in under 10 ms"
+    assert calls == 5  # failed fast without touching upstream (the live gate measures the ms)
 
 
 async def test_upstream_never_sees_more_than_4_even_with_retries() -> None:

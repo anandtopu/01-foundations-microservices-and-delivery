@@ -76,10 +76,10 @@ poll-once:  ## (M3) One sftp-poller cycle on the host, then exit
 	env $(HOST_ENV) uv run python -m gateway.ingest.poller --once
 
 api-local:  ## (M5) Run the gateway API on the host, :8000, against the mocks; Ctrl-C to stop
-	env $(HOST_ENV) SOAP_BASE_URL=http://localhost:8080 uv run uvicorn gateway.app:app --port 8000
+	env $(HOST_ENV) SOAP_BASE_URL=http://localhost:8080 uv run uvicorn gateway.app:app --port 8000 --no-server-header
 
 load-quotes:  ## (M5) 50-VU k6 burst on POST /v1/rate-quotes (needs api-local); then check /__stats
-	k6 run load/quotes.js
+	k6 run --no-usage-report load/quotes.js
 
 migrate:  ## (M8) Apply additive migrations
 	$(COMPOSE) run --rm gateway-api python -m gateway.migrate

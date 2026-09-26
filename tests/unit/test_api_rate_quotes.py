@@ -116,3 +116,163 @@ async def test_unexpected_errors_are_a_bare_500_problem() -> None:
     assert r.status_code == 500
     assert r.json()["type"].endswith("/internal-error")
     assert "secret" not in r.text
+
+
+# --- PR #3 review ---------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        RESULT | {"TotalCharge": "1e3"},
+        RESULT | {"TotalCharge": "-5.00"},
+        RESULT | {"TotalCharge": "974.567"},
+        RESULT | {"Currency": "usd"},
+        RESULT | {"Currency": "<script>"},
+        RESULT | {"TransitDays": "-4"},
+        RESULT | {"TransitDays": "1_0"},
+        RESULT | {"TransitDays": "99999999999999999999999"},
+        RESULT | {"TransitDays": "٣"},
+        {"QuoteRef": "MRQ-1"},  # the fields are missing entirely
+    ],
+    ids=[
+        "exponent", "negative", "3dp", "lowercase_ccy", "markup_ccy", "negative_days",
+        "underscore_days", "huge_days", "arabic_days", "missing",
+    ],
+)  # fmt: skip
+async def test_unusable_upstream_data_never_becomes_a_201(result: dict[str, str]) -> None:
+    client, _ = api(result)
+    async with client:
+        r = await client.post("/v1/rate-quotes", json=BODY, headers=KEY)
+    assert r.status_code == 502
+    assert r.json()["type"].endswith("/upstream-invalid-response")
+    assert "your request" in r.json()["detail"]  # says it is NOT the shipper's fault
+
+
+async def test_upstream_money_is_normalised_to_two_decimals() -> None:
+    client, _ = api(RESULT | {"TotalCharge": "974.5", "QuoteRef": "bad ref with spaces"})
+    async with client:
+        r = await client.post("/v1/rate-quotes", json=BODY, headers=KEY)
+    assert r.status_code == 201
+    assert r.json()["total_charge"] == "974.50"  # contract pattern ^[0-9]+\.[0-9]{2}$
+    assert "upstream_ref" not in r.json()  # optional field: omitted rather than junk
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "status", "slug"),
+    [("GET", "/nope", 404, "not-found"), ("PUT", "/v1/rate-quotes", 405, "method-not-allowed")],
+)
+async def test_routing_errors_are_problem_details(
+    method: str, path: str, status: int, slug: str
+) -> None:
+    client, _ = api(RESULT)
+    async with client:
+        r = await client.request(method, path)
+    assert r.status_code == status
+    assert r.headers["Content-Type"] == "application/problem+json"
+    assert r.json()["type"].endswith(f"/{slug}")
+    if status == 405:
+        assert r.headers["Allow"] == "POST"
+
+
+@pytest.mark.parametrize("content_type", ["text/plain", "application/x-www-form-urlencoded", ""])
+async def test_non_json_bodies_are_415(content_type: str) -> None:
+    client, stub = api(RESULT)
+    async with client:
+        r = await client.post(
+            "/v1/rate-quotes",
+            content=b'{"origin_zip":"30301"}',
+            headers=KEY | {"Content-Type": content_type},
+        )
+    assert r.status_code == 415
+    assert r.json()["type"].endswith("/unsupported-media-type")
+    assert stub.calls == 0
+
+
+async def test_json_with_charset_is_fine(ok: tuple[httpx.AsyncClient, Stub]) -> None:
+    client, _ = ok
+    r = await client.post(
+        "/v1/rate-quotes",
+        content=httpx.Request("POST", "/", json=BODY).content,
+        headers=KEY | {"Content-Type": "application/json; charset=utf-8"},
+    )
+    assert r.status_code == 201
+
+
+async def test_oversize_body_is_413_by_content_length(ok: tuple[httpx.AsyncClient, Stub]) -> None:
+    client, stub = ok
+    big = b'{"x":"' + b"a" * (64 * 1024) + b'"}'
+    r = await client.post(
+        "/v1/rate-quotes", content=big, headers=KEY | {"Content-Type": "application/json"}
+    )
+    assert r.status_code == 413
+    assert r.json()["type"].endswith("/payload-too-large")
+    assert stub.calls == 0
+
+
+async def test_oversize_body_is_413_without_content_length_too() -> None:
+    from gateway.errors import RequestGuard
+
+    seen: list[str] = []
+
+    async def app(scope: dict[str, object], receive: object, send: object) -> None:
+        seen.append("app reached")
+
+    guard = RequestGuard(app, max_body=100)  # type: ignore[arg-type]
+    chunks = [b"x" * 60, b"x" * 60]  # 120 bytes, chunked: no Content-Length header
+    sent: list[dict[str, object]] = []
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": chunks.pop(0), "more_body": bool(chunks)}
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+
+    scope = {"type": "http", "method": "POST", "headers": [(b"content-type", b"application/json")]}
+    await guard(scope, receive, send)  # type: ignore[arg-type]
+    assert sent[0]["status"] == 413
+    assert seen == []
+
+
+async def test_malformed_json_is_400(ok: tuple[httpx.AsyncClient, Stub]) -> None:
+    client, _ = ok
+    r = await client.post(
+        "/v1/rate-quotes",
+        content=b'{"origin_zip":',
+        headers=KEY | {"Content-Type": "application/json"},
+    )
+    assert r.status_code == 400
+    assert r.json()["type"].endswith("/malformed-json")
+
+
+async def test_validation_errors_are_capped_and_pointer_escaped(
+    ok: tuple[httpx.AsyncClient, Stub],
+) -> None:
+    client, _ = ok
+    body: dict[str, object] = BODY | {f"k{i}": 1 for i in range(100)} | {"a/b~c": 1}
+    r = await client.post("/v1/rate-quotes", json=body, headers=KEY)
+    assert r.status_code == 422
+    problem = r.json()
+    assert len(problem["errors"]) == 20
+    assert "101 problem(s)" in problem["detail"]
+    r = await client.post("/v1/rate-quotes", json=BODY | {"a/b~c": 1}, headers=KEY)
+    assert [e["location"] for e in r.json()["errors"]] == ["/body/a~1b~0c"]
+
+
+async def test_500_carries_an_instance_for_support() -> None:
+    client, _ = api(RuntimeError("secret internals"))
+    async with client:
+        r = await client.post("/v1/rate-quotes", json=BODY, headers=KEY)
+    assert r.json()["instance"].startswith("urn:uuid:")
+
+
+async def test_trial_in_flight_says_retry_after_1() -> None:
+    client, _ = api(CircuitOpenError("half-open trial in flight", 1.0))
+    async with client:
+        r = await client.post("/v1/rate-quotes", json=BODY, headers=KEY)
+    assert (r.status_code, r.headers["Retry-After"]) == (503, "1")
+
+
+async def test_no_generated_openapi_is_published(ok: tuple[httpx.AsyncClient, Stub]) -> None:
+    client, _ = ok
+    assert (await client.get("/openapi.json")).status_code == 404  # the contract is the YAML

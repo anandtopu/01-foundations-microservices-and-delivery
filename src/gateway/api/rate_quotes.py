@@ -7,9 +7,11 @@ The model mirrors `RateQuoteRequest` in contracts/openapi.yaml and is the first 
 nothing reaches the SOAP envelope unless it passed here.
 """
 
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Annotated, Literal
 
 import httpx
@@ -17,12 +19,33 @@ from fastapi import APIRouter, Header, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from gateway.resilience import Bulkhead, CircuitBreaker, retry_full_jitter
-from gateway.soap.client import UpstreamRejected, get_rate_quote
+from gateway.soap.client import UpstreamInvalidResponse, get_rate_quote
 
 # [0-9], never \d: in Python regexes \d also matches other scripts' digits ("٣٠٣٠١"), which the
 # contract's ECMA-262 pattern does not, and which Meridian's AS/400 would not understand.
 ZIP = r"^[0-9]{5}$"
 QUOTE_TTL = timedelta(minutes=15)  # FR-4: stored for 15 minutes
+
+# What we accept from Meridian before it goes into a 201 (contract: RateQuote). Plain digits only:
+# int() and Decimal() alone would accept "-4", "1_0", "1e3" and non-ASCII digits (PR #3 review).
+_MONEY = re.compile(r"[0-9]{1,10}(\.[0-9]{1,2})?")
+_CURRENCY = re.compile(r"[A-Z]{3}")
+_DAYS = re.compile(r"[0-9]{1,3}")
+_REF = re.compile(r"[\x21-\x7E]{1,64}")
+
+
+def contract_fields(result: dict[str, str]) -> tuple[str, str, int, str | None]:
+    """(total_charge "974.50", currency, transit_days, upstream_ref) or UpstreamInvalidResponse."""
+    total = result.get("TotalCharge", "")
+    currency = result.get("Currency", "")
+    days = result.get("TransitDays", "")
+    if not (_MONEY.fullmatch(total) and _CURRENCY.fullmatch(currency) and _DAYS.fullmatch(days)):
+        raise UpstreamInvalidResponse(
+            f"unusable GetRateQuoteResult: TotalCharge={total!r} Currency={currency!r} "
+            f"TransitDays={days!r}"
+        )
+    ref = result.get("QuoteRef", "")
+    return f"{Decimal(total):.2f}", currency, int(days), ref if _REF.fullmatch(ref) else None
 
 
 class RateQuoteRequest(BaseModel):
@@ -78,22 +101,19 @@ async def create_rate_quote(
     body: RateQuoteRequest, request: Request, response: Response, idempotency_key: IdempotencyKey
 ) -> dict[str, object]:
     service: QuoteService = request.app.state.quotes
-    result = await service.quote(body)
-    try:
-        total, currency = result["TotalCharge"], result["Currency"]
-        transit_days = int(result["TransitDays"])
-    except (KeyError, ValueError) as exc:  # a success response we cannot map is still upstream's
-        raise UpstreamRejected(f"unexpected GetRateQuoteResult: {sorted(result)}") from exc
+    total, currency, transit_days, upstream_ref = contract_fields(await service.quote(body))
     now = datetime.now(UTC)
     quote_id = uuid.uuid4()
     response.headers["Location"] = f"/v1/rate-quotes/{quote_id}"
-    return {
+    quote: dict[str, object] = {
         "quote_id": str(quote_id),
         "request": body.model_dump(),
         "total_charge": total,
         "currency": currency,
         "transit_days": transit_days,
-        "upstream_ref": result.get("QuoteRef", ""),
         "created_at": now.isoformat(),
         "expires_at": (now + QUOTE_TTL).isoformat(),
     }
+    if upstream_ref:  # optional in the contract: omit rather than send junk
+        quote["upstream_ref"] = upstream_ref
+    return quote

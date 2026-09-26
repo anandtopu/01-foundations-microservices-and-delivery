@@ -141,7 +141,13 @@ Ask for a rate quote (201, or a 503 Problem Details with `Retry-After` when Meri
 curl -s -X POST localhost:8000/v1/rate-quotes -H 'Content-Type: application/json' -H 'Idempotency-Key: readme-0001-aaaaaaaa' -d '{"origin_zip":"30301","dest_zip":"60601","weight_lb":1200,"service_level":"LTL_STANDARD"}'
 ```
 
-Burst it with 50 virtual users for 20 s (the M5 gate), then see what Meridian's side saw:
+Reset the mock's counters, so its peak concurrency reflects only the burst:
+
+```bash
+curl -s -X POST localhost:8080/__reset
+```
+
+Burst it with 50 virtual users for 20 s (the M5 gate), then see what Meridian's side saw (`peak_concurrency` must be at most 4):
 
 ```bash
 make load-quotes
