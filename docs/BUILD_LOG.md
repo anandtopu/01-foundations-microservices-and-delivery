@@ -1115,4 +1115,19 @@ Separately, the earlier `SKIP LOCKED` mutant is still caught.
    - *Fix:* the fixture now resets on teardown too.
 
 **Verification after the fixes:**
-{{REGATE}}
+The live gate was re-run on the lab stack with the reviewed code (`make api-local`, `make poll-local`, `WEBHOOK_MAX_AGE=120s make dispatch-local`):
+- **Signatures:** 40 new shipments gave 6 ACME deliveries, all delivered, and **20 of 20 attempts `signature=valid`**. 14 of those attempts were answered `503` by the sink the M2 test had left broken ("What broke" 2), and were retried with backoff.
+- **Max age:** with the sink stopped, 30 new shipments gave 14 deliveries, **14 of 14 dead-lettered**, each **120.3 s** after its window opened. The clamp holds: before the fix, a 6 h backoff drawn late in the window could overshoot by hours.
+- **List order:** `GET /v1/dead-letters?kind=webhook` returned the 14 open dead letters first, then the 5 resolved ones from the original gate, as the contract says.
+- **Replay:**
+  - 14 × `202 queued`, then all 14 delivered on the first attempt, with signatures valid and the dead letters resolved.
+  - An immediate second replay got **`409 already-queued`**, where it used to reset a live lease.
+  - 15 audit rows, every one with `ops_key_id` set.
+- **Totals:** `webhook_deliveries` holds 156 `delivered` rows (136 + 6 + 14) and nothing else; the sink logged 0 invalid signatures.
+- **`make check`:** ruff and `mypy --strict` clean, **357 passed** (from 319: 38 new tests).
+
+**Lessons:**
+- **A worker that serves every tenant must turn *anything* a tenant controls into data, not exceptions.** A URL, a response header or a response body must never be able to reach the control flow. "Catch the transport errors" wasn't enough; "`attempt()` never raises" is the rule.
+- **Adding a second writer invalidates the first writer's assumptions.** The owner check was sound while the poller was alone under its advisory lock. The replay endpoint made it a check-then-act race, so the rule moved into the statement itself (`WHERE s.client_id = EXCLUDED.client_id`).
+- **A lease needs a fencing token wherever its holder writes,** here in `record()` as in M6's `complete()`. A timeout that can be exceeded (DNS, a batch of 50) turns a "can't happen" overwrite into a Tuesday.
+- **Be exact about what a control defends against.** A per-attempt SSRF check defeats slow DNS changes, not rebinding. Writing it up accurately (difference 44) is what makes the egress proxy a requirement rather than a nice-to-have.
