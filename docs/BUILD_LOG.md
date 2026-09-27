@@ -1527,7 +1527,7 @@ The rollback works with no down-migration, since migrations are additive. With o
 3. "Not reachable" is a claim about today's code and today's `sys.path`, and an attacker with a shell in the container doesn't care about our venv. Removing pip costs nothing at runtime, turns an argument into a fact (a clean scan), and keeps the scan meaningful: a report that is always "3 known, ignored" hides the day a real one appears.
 </details>
 
-**What would break in production here:**
+**What would break in production here (spec section 12):**
 - **Sampling that hides the rare failure.** At 10% head sampling, a 1-in-1,000 error has only a 10% chance of having a trace. Keep error traces with tail-based sampling at the collector, and use the metrics (100%) for the SLIs.
 - **One replica.** A deploy, a rollback or a crash is visible to shippers (20 s here). Run at least 2.
 - **Chaos without guard rails.** These scripts kill containers by name in *this* Compose project only. Pointed at a shared environment, they are an outage.

@@ -1,14 +1,14 @@
 # Interview notes: P01 Legacy Integration Gateway
 
-Every number here was **measured in this lab**: Docker Compose on a 4-CPU, 16 GB cloud VM, with mocks standing in for Meridian's IBM i. The spec's targets are quoted only as targets. The M-number after each number points to the `docs/BUILD_LOG.md` section with the raw output.
+Every number here was **measured in this lab**: Docker Compose on a 4-CPU cloud VM, with mocks standing in for Meridian's IBM i. The spec's targets are quoted only as targets. The M-number after each number points to the `docs/BUILD_LOG.md` section with the raw output.
 
 ## The 2-minute pitch
 
 > "In a composite 3PL, an AS/400 dropped CSVs over SFTP, a SOAP rate service fell over above five concurrent calls, and nothing on the IBM i side could change. So everything lives in a gateway.
 >
-> I wrote the OpenAPI 3.1 contract first. Schemathesis fuzzes the running service against it on every build: about 3,000 generated cases, zero failures.
+> I wrote the OpenAPI 3.1 contract first. Schemathesis fuzzes the running service against it at every milestone: about 3,000 generated cases, zero failures.
 >
-> Files are ingested exactly once, by content hash plus a per-batch checkpoint that commits with the rows. I SIGKILLed the poller in the middle of a 20,000-row file, and it resumed from line 3,001 and ended with exactly 19,960 shipments and 40 dead letters, with no duplicate events. Bad rows are dead-lettered for an audited replay.
+> Files are ingested exactly once, by content hash plus a per-batch checkpoint that commits with the rows. I SIGKILLed the poller in the middle of a 20,000-row file, and it resumed after line 3,001 and ended with exactly 19,960 shipments and 40 dead letters, with no duplicate events. Bad rows are dead-lettered for an audited replay.
 >
 > The SOAP service sits behind a bulkhead of four, full-jitter retries and a circuit breaker. Under a 50-VU burst at the spec's 2.8-second latency, the mock never saw more than 4 concurrent calls. When I killed it, the breaker opened in 1.2 seconds and closed itself 30 seconds after recovery.
 >
@@ -26,8 +26,8 @@ Every number here was **measured in this lab**: Docker Compose on a 4-CPU, 16 GB
 | Breaker open after the upstream dies | **1.2 s** (spec < 10 s); closed again 30.5 s after recovery | `docker compose kill soap-mock` | M9 |
 | Exactly-once under a mid-file crash | **19,960 / 19,960** shipments, **40 / 40** dead letters, **6,597 / 6,597** events | SIGKILL at line 3,001 with a batch uncommitted | M9 |
 | Webhook delivery age | **p50 2.75 s, p99 4.53 s** (SLI 60 s) | 657 events from a 2,000-row file | M9 |
-| Freshness (`.done` → committed) | **4.3 s** | 2,000-row file with the demo's 5 s poll; production polls every 60 s, which bounds it | M9 |
-| Postgres down 30 s | **0 × 500**; `503` + not-ready; ready **0.6 s** after it returned; **0 restarts** | `docker compose stop postgres` | M9 |
+| Freshness (`.done` → committed) | **4.3 s** (one file, n = 1: not a p99) | 2,000-row file with the demo's 5 s poll; production polls every 60 s, which bounds it | M9 |
+| Postgres stopped ~35 s (spec: 30 s) | **0 × 500**; `503` + not-ready; ready **0.6 s** after it returned; **0 restarts** | `docker compose stop postgres` | M9 |
 | Contract conformance | **0 failures**, 3,125 of 3,125 cases | Schemathesis 4.28 `--checks all` | M8, M9 |
 | Image | **179 MB** listed (136.5 MB unpacked), `USER 10001`, **0 CVEs** | Trivy 0.74.0 pinned by digest, after removing the base image's unused pip | M8, M9 |
 | Branch coverage (ingest, resilience, webhooks) | **96%** (every module ≥ 91%) | spec ≥ 90%; it was 88% before M9 added worker-loop tests | M9 |
@@ -61,13 +61,26 @@ These are good follow-up material, because they show debugging rather than a res
 
 ## 10-minute demo script (spec section 11)
 
-Before the demo:
+Before the demo, on a fresh VM (the README explains each step). The one-time setup: keys, the mocks, the pinned host key, the image and the schema.
 ```bash
 bash scripts/cloud-setup.sh
 ```
 
 ```bash
+make keys && make mocks && make pin-hostkey
+```
+
+```bash
+make image && make migrate && make dev-keys
+```
+
+Then the gateway and, separately, the observability stack. `make up` starts only the gateway's three services.
+```bash
 make up
+```
+
+```bash
+docker compose up -d otel-lgtm
 ```
 
 Check it is ready:

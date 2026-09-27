@@ -54,7 +54,7 @@ docker compose up -d --force-recreate sftp-poller
 docker compose logs sftp-poller --since 5m | grep -E "file=|not trusted" | tail
 ```
 
-Look for the next cycle listing the drop. Then `gateway_ingest_lag` should record new samples and `gateway_ingest_rows_total` should grow.
+Look for the next cycle listing the drop. Then `gateway_ingest_lag_seconds_count` should increase and `gateway_ingest_rows_total` should grow.
 
 ## 6. Afterwards
 

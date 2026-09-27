@@ -8,6 +8,8 @@ import threading
 import time
 import urllib.request
 
+from _lab import REPO
+
 
 def running():
     out = subprocess.run(
@@ -60,34 +62,46 @@ def switch(tag):
     t = threading.Thread(target=probe, args=(stop, tally))
     t.start()
     t0 = time.monotonic()
-    subprocess.run(
-        [
-            "docker",
-            "compose",
-            "up",
-            "-d",
-            "--no-build",
-            "gateway-api",
-            "sftp-poller",
-            "webhook-dispatcher",
-        ],
-        env=os.environ | {"GATEWAY_TAG": tag, "SFTP_POLL_INTERVAL_S": "5"},
-        capture_output=True,
-    )
-    while True:
-        try:
-            with urllib.request.urlopen("http://localhost:8000/readyz", timeout=2) as r:
-                if r.status == 200:
-                    break
-        except Exception:
-            pass
-        time.sleep(0.2)
-    ready = time.monotonic() - t0
-    time.sleep(1)
-    stop.set()
-    t.join()
+    try:
+        # check=True: an image never tagged locally makes `up --no-build` fail while the OLD
+        # containers keep answering /readyz, which would read as an instant, successful rollback.
+        subprocess.run(
+            [
+                "docker",
+                "compose",
+                "up",
+                "-d",
+                "--no-build",
+                "gateway-api",
+                "sftp-poller",
+                "webhook-dispatcher",
+            ],
+            cwd=REPO,
+            env=os.environ | {"GATEWAY_TAG": tag, "SFTP_POLL_INTERVAL_S": "5"},
+            check=True,
+            capture_output=True,
+        )
+        deadline = t0 + 120
+        while True:
+            if time.monotonic() > deadline:
+                raise SystemExit(f"GATEWAY_TAG={tag}: not ready after 120 s")
+            try:
+                with urllib.request.urlopen("http://localhost:8000/readyz", timeout=2) as r:
+                    if r.status == 200:
+                        break
+            except Exception:
+                pass
+            time.sleep(0.2)
+        ready = time.monotonic() - t0
+        time.sleep(1)
+    finally:
+        stop.set()
+        t.join()
+    images = sorted(set(running()))
+    if images != [f"meridian-gateway:{tag}"]:
+        raise SystemExit(f"GATEWAY_TAG={tag}: running {images}, not the requested image")
     print(f"GATEWAY_TAG={tag}: ready {ready:.1f} s after `compose up`")
-    print(f"  running {sorted(set(running()))}; pip present: {has_pip()}")
+    print(f"  running {images}; pip present: {has_pip()}")
     print(f"  health probes ok/failed during the switch: {tally['ok']}/{tally['fail']}")
 
 
@@ -96,3 +110,5 @@ if __name__ == "__main__":
     print("before:", sorted(set(running())), "pip present:", has_pip())
     switch(old_tag)  # roll BACK to the previous release
     switch(new_tag)  # roll FORWARD again
+    # The switches ran with SFTP_POLL_INTERVAL_S=5 (the demo value); `make up` restores .env's.
+    print("note: the poller now polls every 5 s; run `make up` to return to the .env settings")

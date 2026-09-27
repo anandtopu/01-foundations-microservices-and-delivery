@@ -285,10 +285,14 @@ Chaos: kill the SOAP mock (the breaker opens and closes by itself), stop Postgre
 python3 scripts/m9/chaos_kill_soap.py
 ```
 
-Known vulnerabilities in the locked dependencies, then the image (Trivy pinned by digest; ARCHITECTURE difference 64):
+Known vulnerabilities in the locked dependencies (pip-audit), then in the image (Trivy pinned by digest; ARCHITECTURE difference 64; fails on any HIGH or CRITICAL):
 
 ```bash
 make audit
+```
+
+```bash
+make scan
 ```
 
 Roll back to an older image and forward again (spec section 6; both tags come from `make image`):

@@ -15,6 +15,7 @@ import sys
 import time
 
 import psycopg
+from _lab import REPO, compose
 
 DSN = "postgresql://gateway:gateway@localhost:5432/gateway"
 WRITER_LOCK = 0x5348_4950  # gateway.ingest.poller.SHIPMENT_WRITER_LOCK
@@ -22,7 +23,7 @@ IDS = "shipment_id BETWEEN 'SHP8000001' AND 'SHP8020000'"  # the 20k file's id r
 
 
 def sh(*cmd: str) -> str:
-    return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+    return subprocess.run(cmd, cwd=REPO, check=True, capture_output=True, text=True).stdout.strip()
 
 
 def main(path: str) -> None:
@@ -52,12 +53,15 @@ def main(path: str) -> None:
                 raise SystemExit("the file never started")
             time.sleep(0.005)
         blocker.execute("SELECT pg_advisory_lock(%s)", (WRITER_LOCK,))  # next batch now blocks
-        time.sleep(0.5)  # let the poller reach the lock inside its next, uncommitted batch
-        waiting = one("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted")
-        sh("docker", "compose", "kill", "sftp-poller")  # SIGKILL, mid-batch
-        print(f"SIGKILL poller at checkpoint {checkpoint()}; writers blocked: {waiting[0]}")
-        blocker.execute("SELECT pg_advisory_unlock(%s)", (WRITER_LOCK,))
-        sh("docker", "compose", "start", "sftp-poller")
+        try:
+            time.sleep(0.5)  # let the poller reach the lock inside its next, uncommitted batch
+            q = "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted"
+            waiting = one(q)
+            compose("kill", "sftp-poller")  # SIGKILL, mid-batch
+            print(f"SIGKILL poller at checkpoint {checkpoint()}; writers blocked: {waiting[0]}")
+        finally:  # whatever happened, release the writers and bring the poller back
+            blocker.execute("SELECT pg_advisory_unlock(%s)", (WRITER_LOCK,))
+            compose("start", "sftp-poller")
         t1 = time.monotonic()
         while (row := checkpoint()) is None or row[0] != "done":
             if time.monotonic() - t1 > 180:

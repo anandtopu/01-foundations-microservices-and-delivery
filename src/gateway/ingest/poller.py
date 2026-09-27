@@ -191,6 +191,7 @@ async def reject(
             (file_id,),
         )
     log.warning("file=%r rejected: %s", f.name, reason)
+    telemetry.ingest_rows.add(1, {"outcome": "dead_lettered"})  # the one line-1 dead letter
     result.status, result.rows_dead = "rejected", result.rows_dead + 1
     return result
 

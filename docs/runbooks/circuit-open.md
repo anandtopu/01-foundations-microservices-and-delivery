@@ -1,6 +1,11 @@
 # Runbook: SOAP circuit open
 
-**Alert:** `CircuitOpen` (ticket), when `gateway_circuit_state == 2` for more than 5 minutes.
+**Alert:** `CircuitOpen` (ticket), when the breaker has been open for more than 5 minutes:
+
+```text
+min_over_time(gateway_circuit_state[5m]) == 2
+```
+
 **What shippers see:** `POST /v1/rate-quotes` fails fast with `503` `circuit-open` and a `Retry-After`. Shipment reads and webhooks are not affected; `/readyz` still reports `ready`, with `"soap_circuit":"open"`.
 
 The breaker opens after 5 retryable failures in a row (`Server*` SOAP faults, 5xx, 429, timeouts, connection errors). After 30 s it lets exactly one trial call through (half-open); success closes it, failure re-opens it for another 30 s.

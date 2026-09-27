@@ -7,6 +7,8 @@ import time
 import urllib.error
 import urllib.request
 
+from _lab import compose
+
 
 def code(url, key=True):
     req = urllib.request.Request(url, headers={"X-API-Key": "dev-shipper-key"} if key else {})
@@ -38,15 +40,17 @@ def restarts():
 
 print("before:", restarts())
 seen = collections.Counter()
-subprocess.run(["docker", "compose", "stop", "-t", "5", "postgres"], capture_output=True)
 t0 = time.monotonic()
-print("postgres stopped")
-while time.monotonic() - t0 < 30:
-    seen[("readyz", code("http://localhost:8000/readyz", False))] += 1
-    seen[("shipments", code("http://localhost:8000/v1/shipments?limit=1"))] += 1
-    time.sleep(1)
-print("during the outage:", dict(seen))
-subprocess.run(["docker", "compose", "start", "postgres"], capture_output=True)
+try:
+    compose("stop", "-t", "5", "postgres")
+    print("postgres stopped")
+    while time.monotonic() - t0 < 30:
+        seen[("readyz", code("http://localhost:8000/readyz", False))] += 1
+        seen[("shipments", code("http://localhost:8000/v1/shipments?limit=1"))] += 1
+        time.sleep(1)
+    print("during the outage:", dict(seen))
+finally:  # Ctrl-C or a crash must not leave the lab without its database
+    compose("start", "postgres")
 t1 = time.monotonic()
 print(f"postgres started after {t1 - t0:.0f} s down")
 while time.monotonic() - t1 < 90:

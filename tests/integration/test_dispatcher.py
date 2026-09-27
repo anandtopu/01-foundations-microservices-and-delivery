@@ -510,7 +510,6 @@ def test_the_lab_ca_is_trusted_only_when_configured() -> None:
     ca = Path(__file__).resolve().parents[2] / "secrets" / "webhook-ca.crt"
     if not ca.exists():
         pytest.skip("no lab CA (make certs)")
-    plain = dispatcher.http_client(CFG)
-    lab = dispatcher.http_client(Settings(**(CFG.model_dump() | {"webhook_ca_bundle": ca})))
-    ssl_plain, ssl_lab = (c._transport._pool._ssl_context for c in (plain, lab))  # type: ignore[attr-defined]
+    ssl_plain = dispatcher.tls_context(CFG)
+    ssl_lab = dispatcher.tls_context(Settings(**(CFG.model_dump() | {"webhook_ca_bundle": ca})))
     assert len(ssl_lab.get_ca_certs()) == len(ssl_plain.get_ca_certs()) + 1

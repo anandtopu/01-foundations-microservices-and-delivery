@@ -3,8 +3,11 @@
 **Alert:** `DeadLettersGrowing` (ticket), when more than 50 new dead letters arrive in 1 hour:
 
 ```text
-increase(gateway_ingest_rows_total{outcome="dead_lettered"}[1h]) > 50
+increase(gateway_ingest_rows_total{outcome="dead_lettered"}[1h])
+  + clamp_min(delta(gateway_dead_letters_open{kind="webhook"}[1h]), 0) > 50
 ```
+
+The first term counts every new row dead letter (whole-file rejections included). Webhook dead letters have no counter, so the second term is the growth of the open webhook backlog, which under-counts if some were replayed in the same hour.
 
 The backlog by kind is `gateway_dead_letters_open{kind="row"|"webhook"}`.
 
@@ -24,6 +27,12 @@ SELECT kind, split_part(reason, ':', 1) AS reason, count(*) FROM dead_letters
  WHERE resolved_at IS NULL GROUP BY 1, 2 ORDER BY 3 DESC;
 ```
 
+The `WebhookBacklogOld` check (the oldest pending delivery is older than 15 min) has no metric yet (ARCHITECTURE difference 67); until it has one, it is this query:
+
+```sql
+SELECT now() - min(created_at) AS oldest_pending FROM webhook_deliveries WHERE status = 'pending';
+```
+
 ## 2. Decide by reason
 
 | Reason | What happened | Action |
@@ -31,7 +40,7 @@ SELECT kind, split_part(reason, ':', 1) AS reason, count(*) FROM dead_letters
 | `status: unknown status code 'Q'` (a new code) | The IBM i team added a status code | Agree the mapping with Meridian, add it to the status map (a code change with a test), deploy, then **replay** (step 3) |
 | `owner change refused: 'A' -> 'B'` | A file tried to move a shipment to another shipper | **Do not replay.** It's a data or tenancy question for Meridian: which shipper owns it? Only a correction from them fixes it |
 | a date or weight parse error | A malformed export | Ask Meridian to re-export; do not hand-edit rows |
-| `file rejected: ...` (line 1) | Bad header or encoding for the whole file | Check the file (cp1252? the header changed?). A schema change needs a gateway change first |
+| `unexpected header ...`, `not valid Windows-1252 at byte N` or `empty file` (line 1; the file's status is `rejected`) | Bad header or encoding for the whole file | Check the file (cp1252? the header changed?). A schema change needs a gateway change first |
 | webhook `max age 72h exceeded (last: HTTP 5xx / ConnectError)` | A shipper's endpoint was down for 3 days | Confirm with the shipper that it's back, then replay |
 | webhook `... (last: ssrf: ...)` | The subscription's host now resolves to a private address | **Do not replay.** Treat it as suspicious and contact the shipper |
 

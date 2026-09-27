@@ -151,6 +151,16 @@ async def _send(client: httpx.AsyncClient, job: Job, cfg: Settings) -> Outcome:
 
 async def record(conn: AsyncConnection, job: Job, outcome: Outcome, cfg: Settings) -> str:
     """Persist one attempt's outcome; returns a short log description."""
+    desc = await persist(conn, job, outcome, cfg)
+    # M9: the 60 s delivery SLI, event -> receiver's 2xx. Recorded only once the row has committed,
+    # so a failed COMMIT (the row is redelivered) cannot put the same delivery in twice.
+    if outcome.kind == "delivered" and job.created_at is not None:
+        age = datetime.now(job.created_at.tzinfo) - job.created_at
+        telemetry.webhook_delivery_age.record(max(0.0, age.total_seconds()))
+    return desc
+
+
+async def persist(conn: AsyncConnection, job: Job, outcome: Outcome, cfg: Settings) -> str:
     async with conn.transaction():
         if outcome.kind == "delivered":
             # The receiver has it, whatever happened to the row meanwhile: delivered wins.
@@ -166,9 +176,6 @@ async def record(conn: AsyncConnection, job: Job, outcome: Outcome, cfg: Setting
                     WHERE delivery_id = %s AND kind = 'webhook' AND resolved_at IS NULL""",
                 (job.delivery_id,),
             )
-            if job.created_at is not None:  # M9: the 60 s delivery SLI, event -> receiver's 2xx
-                age = datetime.now(job.created_at.tzinfo) - job.created_at
-                telemetry.webhook_delivery_age.record(max(0.0, age.total_seconds()))
             return "delivered"
         if outcome.kind == "gone":
             await conn.execute(
@@ -266,13 +273,19 @@ async def dispatch_once(conn: AsyncConnection, client: httpx.AsyncClient, cfg: S
     return len(jobs)
 
 
-def http_client(cfg: Settings) -> httpx.AsyncClient:
+def tls_context(cfg: Settings) -> ssl.SSLContext:
     # The lab sink's self-signed certificate is trusted by the DISPATCHER only (an extra CA on top
     # of the system store), never by the rest of the gateway.
     ctx = ssl.create_default_context()
     if cfg.webhook_ca_bundle:
         ctx.load_verify_locations(cfg.webhook_ca_bundle)
-    return httpx.AsyncClient(verify=ctx, follow_redirects=False, timeout=cfg.webhook_timeout_s)
+    return ctx
+
+
+def http_client(cfg: Settings) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        verify=tls_context(cfg), follow_redirects=False, timeout=cfg.webhook_timeout_s
+    )
 
 
 DEAD_LETTER_GAUGE_EVERY_S = 30.0
@@ -302,11 +315,14 @@ async def run(cfg: Settings, *, once: bool) -> None:
         while True:
             try:
                 async with await AsyncConnection.connect(cfg.database_url) as conn:
-                    while await dispatch_once(conn, client, cfg):
-                        pass  # drain everything due before sleeping
-                    if time.monotonic() >= next_gauge_at:
-                        await publish_dead_letters(conn)
-                        next_gauge_at = time.monotonic() + DEAD_LETTER_GAUGE_EVERY_S
+                    while True:  # drain everything due before sleeping
+                        more = await dispatch_once(conn, client, cfg)
+                        # Inside the drain too: a long backlog must not leave the gauge stale.
+                        if time.monotonic() >= next_gauge_at:
+                            await publish_dead_letters(conn)
+                            next_gauge_at = time.monotonic() + DEAD_LETTER_GAUGE_EVERY_S
+                        if not more:
+                            break
             except Exception as err:
                 if once:
                     raise

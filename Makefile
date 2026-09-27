@@ -4,7 +4,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 COMPOSE ?= docker compose
 
-.PHONY: help setup sync lint fmt typecheck test cov check contract-lint keys certs base-images mocks pin-hostkey image migrate migrate-local dev-keys poll-local poll-once api-local dispatch-local load-quotes up down logs schemathesis audit reset drop
+.PHONY: help setup sync lint fmt typecheck test cov check contract-lint keys certs base-images mocks pin-hostkey image migrate migrate-local dev-keys poll-local poll-once api-local dispatch-local load-quotes up down logs schemathesis audit scan reset drop
 
 help:  ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-15s %s\n", $$1, $$2}'
@@ -121,7 +121,8 @@ image: base-images  ## (M8) Build meridian-gateway (one image: API, poller, disp
 	@# commit, so `GATEWAY_TAG=<older sha> make up` can roll back (spec section 6).
 	@# ...but only from a clean tree: a SHA tag on a build of uncommitted changes is a lie that a
 	@# rollback would believe (M9: it happened once).
-	@if git diff --quiet HEAD --; then \
+	@# `git status --porcelain`, not `git diff`: an untracked file under src/ is built in too.
+	@if [ -z "$$(git status --porcelain)" ]; then \
 	  docker tag "$$($(COMPOSE) config --images | grep '^meridian-gateway:' | head -1)" meridian-gateway:$$(git rev-parse --short HEAD); \
 	else echo "uncommitted changes: not tagging this build with a commit SHA"; fi
 	docker image ls meridian-gateway
@@ -151,6 +152,20 @@ schemathesis:  ## (M8) Conformance tests against the running API (removes its fu
 audit:  ## Known-vulnerability scan of the locked dependencies
 	uv export --frozen --no-dev --no-hashes -o /tmp/requirements-audit.txt
 	uvx pip-audit==2.10.1 -r /tmp/requirements-audit.txt
+
+# Trivy, pinned by digest (ARCHITECTURE difference 64). Its database comes from mirror.gcr.io,
+# which this lab can reach (Grype's grype.anchore.io is blocked here). In the cloud lab the egress
+# proxy's CA must be trusted inside the container; elsewhere PROXY_CA is empty and adds nothing.
+TRIVY := mirror.gcr.io/aquasec/trivy@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969
+PROXY_CA := $(wildcard /root/.ccr/ca-bundle.crt)
+SCAN_TAG ?= dev
+
+scan:  ## (M9) Scan the gateway image (SCAN_TAG=dev) with digest-pinned Trivy; fails on HIGH/CRITICAL
+	docker run --rm --network host -v /var/run/docker.sock:/var/run/docker.sock \
+	  -v meridian-trivy-cache:/root/.cache -e HTTPS_PROXY -e HTTP_PROXY -e NO_PROXY \
+	  $(if $(PROXY_CA),-v $(PROXY_CA):/etc/ssl/certs/ca-certificates.crt:ro -e SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt) \
+	  $(TRIVY) image --db-repository mirror.gcr.io/aquasec/trivy-db:2 --scanners vuln \
+	  --exit-code 1 --severity HIGH,CRITICAL meridian-gateway:$(SCAN_TAG)
 
 reset:  ## DESTRUCTIVE: remove this project's containers AND volumes (asks first)
 	@read -p "Delete this project's volumes (Postgres data, SFTP host keys)? [y/N] " a && [ "$$a" = y ]

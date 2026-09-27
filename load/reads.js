@@ -34,6 +34,7 @@ export const options = {
 export function setup() {
   // IDs to fetch: the first page of ACME's shipments.
   const res = http.get(`${BASE_URL}/v1/shipments?limit=200`, { headers: { "X-API-Key": API_KEY } });
+  if (res.status !== 200) throw new Error(`listing shipments returned ${res.status}: check API_KEY`);
   const ids = res.json("data").map((s) => s.shipment_id);
   if (ids.length === 0) throw new Error("no shipments to read: ingest a file first");
   return { ids };
@@ -41,9 +42,10 @@ export function setup() {
 
 export default function (data) {
   const headers = { "X-API-Key": API_KEY };
+  const id = data.ids[Math.floor(__ITER / 2) % data.ids.length]; // every id, not only even-indexed ones
   const res =
     __ITER % 2 === 0
-      ? http.get(`${BASE_URL}/v1/shipments/${data.ids[__ITER % data.ids.length]}`, {
+      ? http.get(`${BASE_URL}/v1/shipments/${id}`, {
           headers,
           tags: { name: "GET /v1/shipments/{id}" },
         })
