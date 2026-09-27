@@ -8,10 +8,14 @@ The spec's code, plus lab additions marked "lab:" (ARCHITECTURE.md differences 9
   response could hold a bulkhead slot for 10 s+), and a response-size cap;
 - a response that is not well-formed or uses DTDs/entities (XXE, billion laughs) is rejected;
 - classification the M5 breaker can see: `Server*` faults, other 5xx and 429 are retryable;
-  only `Client` faults and other 4xx mean "our request was wrong" (`UpstreamRejected`).
+  only a SOAP `Client` fault means "Meridian refused THIS request" (`UpstreamRejected`, 422).
+  Anything else we cannot use (an HTML or garbage body, even with a 4xx; an oversize body; no
+  result element; an unexpected fault code) is Meridian or the path to it misbehaving:
+  `UpstreamInvalidResponse`, 502 (PR #6 review: those must never tell a shipper to change a
+  request that was fine, nor hide our outage from 5xx alerting).
 
-Every outcome is exactly one of: a result dict, `UpstreamRejected` (never retried) or
-`RetryableError` (the M5 retry loop may try again; the breaker counts it).
+Every outcome is exactly one of: a result dict, `UpstreamRejected` or `UpstreamInvalidResponse`
+(never retried), or `RetryableError` (the M5 retry loop may try again; the breaker counts it).
 """
 
 import asyncio
@@ -107,7 +111,7 @@ async def get_rate_quote(client: httpx.AsyncClient, q: QuoteInput) -> dict[str, 
         # lab: garbage (an HTML error page), hostile XML, or a bogus encoding declaration.
         if upstream_trouble:
             raise RetryableError(f"http {status}, unparseable body") from exc
-        raise UpstreamRejected(
+        raise UpstreamInvalidResponse(
             f"unparseable response (http {status}): {type(exc).__name__}"
         ) from exc
     fault = root.find(f".//{{{SOAP_NS}}}Fault")
@@ -119,12 +123,14 @@ async def get_rate_quote(client: httpx.AsyncClient, q: QuoteInput) -> dict[str, 
         local = fault_class(code)
         if local == "Server" or local.startswith("Server."):  # includes Server.Busy
             raise RetryableError(code)
-        raise UpstreamRejected(f"{code}: {fault.findtext('faultstring')}")
+        if local == "Client" or local.startswith("Client."):
+            raise UpstreamRejected(f"{code}: {fault.findtext('faultstring')}")
+        raise UpstreamInvalidResponse(f"unexpected SOAP fault code {code!r}")
     if upstream_trouble:
         raise RetryableError(f"http {status} without a SOAP fault")
     result = root.find(f".//{{{RQ_NS}}}GetRateQuoteResult")
     if result is None:
-        raise UpstreamRejected(f"response has no GetRateQuoteResult (http {status})")
+        raise UpstreamInvalidResponse(f"response has no GetRateQuoteResult (http {status})")
     # lab: rpartition, so an unqualified child element cannot raise IndexError
     return {child.tag.rpartition("}")[2]: (child.text or "").strip() for child in result}
 
@@ -148,6 +154,6 @@ async def _post(client: httpx.AsyncClient, body: str) -> tuple[int, bytes]:
         async for chunk in resp.aiter_bytes():
             size += len(chunk)
             if size > MAX_RESPONSE_BYTES:
-                raise UpstreamRejected(f"response larger than {MAX_RESPONSE_BYTES} bytes")
+                raise UpstreamInvalidResponse(f"response larger than {MAX_RESPONSE_BYTES} bytes")
             chunks.append(chunk)
         return resp.status_code, b"".join(chunks)

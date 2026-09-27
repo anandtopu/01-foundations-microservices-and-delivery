@@ -9,11 +9,14 @@ import logging
 import uuid
 
 from fastapi import FastAPI, Request
+from fastapi.dependencies.models import Dependant
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from psycopg_pool import PoolTimeout
 from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.routing import Match
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from gateway.resilience import (
@@ -130,6 +133,57 @@ class RequestGuard:
         await response(scope, receive, send)
 
 
+_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
+
+
+def allowed_methods(request: Request) -> str:
+    """Every method any route serves at this path. Starlette's own Allow header lists only the
+    FIRST route that matched the path: GET and DELETE on /v1/webhook-subscriptions/{id} are two
+    routes, so its 405 said "Allow: GET" (RFC 9110 says: all of them; found by Schemathesis, M8).
+    We ask the router itself, method by method, so included sub-routers are covered too."""
+    allowed = [
+        method
+        for method in _METHODS
+        if any(
+            route.matches({**request.scope, "method": method})[0] is Match.FULL
+            for route in request.app.router.routes
+        )
+    ]
+    return ", ".join(allowed)
+
+
+def declared_query(dependant: Dependant) -> set[str]:
+    names = {param.alias for param in dependant.query_params}
+    for sub in dependant.dependencies:
+        names |= declared_query(sub)
+    return names
+
+
+def reject_unknown_query(request: Request) -> None:
+    """A query parameter the route does not declare is a 422, like an unknown body field
+    (extra="forbid"). Otherwise `?updatedSince=...` (a typo) is silently ignored and the shipper
+    gets EVERY shipment back instead of an error (found by Schemathesis, M8).
+
+    Called by the auth dependency AFTER the key is checked, so an anonymous caller gets 401 first
+    (no pre-auth oracle for which parameters exist), and the unauthenticated probes (/healthz,
+    /readyz) never refuse a load balancer's cache-buster query (PR #6 review)."""
+    route = request.scope.get("route")
+    if not isinstance(route, APIRoute):
+        return
+    unknown = sorted(set(request.query_params) - declared_query(route.dependant))
+    if unknown:
+        raise RequestValidationError(
+            [
+                {
+                    "type": "extra_forbidden",
+                    "loc": ("query", name),
+                    "msg": "Unknown query parameter",
+                }
+                for name in unknown
+            ]
+        )
+
+
 def install(app: FastAPI) -> None:
     """Register the exception handlers on the app."""
 
@@ -140,7 +194,7 @@ def install(app: FastAPI) -> None:
     app.add_middleware(RequestGuard)
 
     @app.exception_handler(StarletteHTTPException)
-    async def _http(_: Request, exc: StarletteHTTPException) -> JSONResponse:
+    async def _http(request: Request, exc: StarletteHTTPException) -> JSONResponse:
         # Routing errors (404, 405) must be Problem Details too (FR-8: every error).
         response = problem(
             exc.status_code,
@@ -148,6 +202,8 @@ def install(app: FastAPI) -> None:
             str(exc.detail),
         )
         response.headers.update(exc.headers or {})  # keeps e.g. 405's Allow header
+        if exc.status_code == 405:
+            response.headers["Allow"] = allowed_methods(request)
         return response
 
     @app.exception_handler(RequestValidationError)
@@ -205,8 +261,11 @@ def install(app: FastAPI) -> None:
     @app.exception_handler(UpstreamRejected)
     async def _rejected(_: Request, exc: UpstreamRejected) -> JSONResponse:
         log.warning("upstream rejected the request: %s", exc)  # faultstring stays in our logs
+        # 422, not 502 (M8, Schemathesis): Meridian answered correctly that THIS request cannot
+        # be quoted (e.g. an origin ZIP it does not serve). That is about the shipper's input; a 5xx
+        # would tell shippers to retry and would page us for their typos. ARCHITECTURE diff. 52.
         return problem(
-            502,
+            422,
             "upstream-rejected",
             "Rate service rejected the request",
             "Meridian's rate service could not quote this shipment. Check the ZIP codes, "

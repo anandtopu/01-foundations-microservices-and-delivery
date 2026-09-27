@@ -71,13 +71,14 @@ class IngestResult:
 # shipment inserted by a concurrent writer, e.g. a dead-letter replay racing the poller: PR #5).
 UPSERT = """
 INSERT INTO shipments AS s
-       (shipment_id, client_id, order_no, status, ship_date, weight_lb, source_file)
-SELECT *, %(file)s FROM unnest(%(ids)s::text[], %(clients)s::text[], %(orders)s::text[],
-                                %(statuses)s::text[], %(dates)s::date[], %(weights)s::numeric[])
+       (shipment_id, client_id, order_no, status, ship_date, weight_lb, source_file, updated_at)
+SELECT *, %(file)s, clock_timestamp()
+  FROM unnest(%(ids)s::text[], %(clients)s::text[], %(orders)s::text[],
+              %(statuses)s::text[], %(dates)s::date[], %(weights)s::numeric[])
 ON CONFLICT (shipment_id) DO UPDATE
    SET order_no = EXCLUDED.order_no, status = EXCLUDED.status,
        ship_date = EXCLUDED.ship_date, weight_lb = EXCLUDED.weight_lb,
-       source_file = EXCLUDED.source_file, updated_at = now()
+       source_file = EXCLUDED.source_file, updated_at = clock_timestamp()
  WHERE s.client_id = EXCLUDED.client_id
    AND (s.order_no, s.status, s.ship_date, s.weight_lb)
        IS DISTINCT FROM
@@ -88,6 +89,14 @@ RETURNING new.shipment_id, new.client_id, new.order_no, new.status, new.ship_dat
 """
 
 OWNERS = "SELECT shipment_id, client_id FROM shipments WHERE shipment_id = ANY(%s) FOR UPDATE"
+
+# Every shipment writer (a poller batch, a dead-letter replay) takes this lock for its transaction,
+# and stamps updated_at with clock_timestamp() AFTER taking it (PR #6 review, reproduced): with
+# now() (the transaction's START) and two concurrent writers, a transaction that started earlier
+# but committed later made rows appear BEHIND a reader's cursor, so GET /v1/shipments and every
+# updated_since feed skipped them forever. Serialised writers + post-lock timestamps mean a row
+# becomes visible only with a timestamp later than everything committed before it.
+SHIPMENT_WRITER_LOCK = 0x5348_4950  # "SHIP"
 
 DEAD = """
 INSERT INTO dead_letters (kind, reason, source, file_id, line_no)
@@ -200,6 +209,7 @@ async def apply_rows(
         latest[g.row.shipment_id] = g
     refused: list[DeadRow] = []
     if latest:
+        await conn.execute("SELECT pg_advisory_xact_lock(%s)", (SHIPMENT_WRITER_LOCK,))
         # Tenant boundary (section 9): a file may not hand a shipment to another shipper.
         # FOR UPDATE holds these rows until the batch commits, so the check cannot go stale.
         cur = await conn.execute(OWNERS, (list(latest),))

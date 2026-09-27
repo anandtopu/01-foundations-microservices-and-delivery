@@ -221,6 +221,42 @@ curl -s 'localhost:8000/v1/dead-letters?kind=webhook' -H 'X-API-Key: dev-ops-key
 curl -s -X POST "localhost:8000/v1/dead-letters/<dead_letter_id>:replay" -H 'X-API-Key: dev-ops-key'
 ```
 
+Package and run the gateway in containers (M8). Stop `make api-local` / `poll-local` / `dispatch-local` first: the containers use the same ports and the same database. Build the one image, then check the gate's size and user (under 200 MB, `USER 10001`):
+
+```bash
+make image
+```
+
+```bash
+docker image inspect meridian-gateway --format '{{.Config.User}}'
+```
+
+Apply migrations from the image, then start the API and both workers:
+
+```bash
+make migrate
+```
+
+```bash
+make up
+```
+
+Check the probes (no API key needed), then read shipments as ACME:
+
+```bash
+curl -s localhost:8000/readyz
+```
+
+```bash
+curl -s 'localhost:8000/v1/shipments?limit=2' -H 'X-API-Key: dev-shipper-key'
+```
+
+Run the contract conformance tests (the M8 gate: expect zero failures). `schemathesis.toml` in the repo root is read automatically:
+
+```bash
+make schemathesis
+```
+
 List every other target:
 
 ```bash

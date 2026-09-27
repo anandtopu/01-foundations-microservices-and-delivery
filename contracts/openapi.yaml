@@ -74,6 +74,7 @@ paths:
               schema: { $ref: '#/components/schemas/ShipmentPage' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '422': { $ref: '#/components/responses/ValidationFailed' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/InternalError' }
@@ -97,6 +98,7 @@ paths:
               schema: { $ref: '#/components/schemas/Shipment' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '422': { $ref: '#/components/responses/ValidationFailed' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -148,15 +150,16 @@ paths:
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '422':
           description: |
-            The body failed validation, or this `Idempotency-Key` was already used with a different body
-            (`type` ends in `/idempotency-key-reused`).
+            The body failed validation, this `Idempotency-Key` was already used with a different body
+            (`type` ends in `/idempotency-key-reused`), or Meridian's rate service refused to quote it, e.g. an
+            origin ZIP it does not serve (`/upstream-rejected`). Not retryable as-is: change the request.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/InternalError' }
         '502':
-          description: Meridian's rate service rejected the request (SOAP Client fault). Not retryable as-is.
+          description: Meridian's rate service answered with data the gateway cannot pass on (`/upstream-invalid-response`). Not a problem with your request.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }

@@ -4,7 +4,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 COMPOSE ?= docker compose
 
-.PHONY: help setup sync lint fmt typecheck test cov check contract-lint keys certs base-images mocks pin-hostkey migrate migrate-local dev-keys poll-local poll-once api-local dispatch-local load-quotes up down logs schemathesis audit reset drop
+.PHONY: help setup sync lint fmt typecheck test cov check contract-lint keys certs base-images mocks pin-hostkey image migrate migrate-local dev-keys poll-local poll-once api-local dispatch-local load-quotes up down logs schemathesis audit reset drop
 
 help:  ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-15s %s\n", $$1, $$2}'
@@ -40,12 +40,14 @@ contract-lint:  ## (M1) Lint the OpenAPI 3.1 contract
 keys:  ## (M2) Generate the gateway SFTP key into secrets/ (skips if present)
 	@mkdir -p secrets && chmod 700 secrets
 	@test -f secrets/gateway_ed25519 || ssh-keygen -t ed25519 -N "" -C gateway@meridian-lab -f secrets/gateway_ed25519
+	@chown 10001:10001 secrets/gateway_ed25519 2>/dev/null \
+	  || echo "WARNING: could not chown secrets/gateway_ed25519 to uid 10001 (not root?). The containerised poller cannot read it: run 'sudo chown 10001 secrets/gateway_ed25519'."
 	cp secrets/gateway_ed25519.pub mocks/sftp/gateway_ed25519.pub
 
 # Docker Hub allows 100 anonymous pulls/h per egress IP, and the cloud VM shares its IP, so we hit 429.
 # mirror.gcr.io is Google's read-through cache of Docker Hub: same image digests, no Hub quota. We pull only
 # what is missing and tag it under the Docker Hub name, so Dockerfiles and compose.yaml stay unchanged.
-BASE_IMAGES ?= library/postgres:18 library/debian:trixie-slim library/python:3.14-slim docker/dockerfile:1
+BASE_IMAGES ?= library/postgres:18 library/debian:trixie-slim library/python:3.14-slim library/python:3.14-alpine docker/dockerfile:1
 IMAGE_MIRROR ?= mirror.gcr.io
 
 base-images:  ## (M2) Pre-pull missing base images via mirror.gcr.io (avoids Docker Hub 429s)
@@ -113,11 +115,18 @@ dispatch-local:  ## (M7) Run the webhook dispatcher on the host (demo: WEBHOOK_M
 load-quotes:  ## (M5) 50-VU k6 burst on POST /v1/rate-quotes (needs api-local); then check /__stats
 	k6 run --no-usage-report load/quotes.js
 
-migrate:  ## (M8) Apply additive migrations
-	$(COMPOSE) run --rm gateway-api python -m gateway.migrate
+image: base-images  ## (M8) Build meridian-gateway (one image: API, poller, dispatcher, migrations) and show its size
+	$(COMPOSE) build gateway-api
+	@# Tag what Compose actually built (its tag comes from GATEWAY_TAG, e.g. "dev" in .env) with the
+	@# commit, so `GATEWAY_TAG=<older sha> make up` can roll back (spec section 6).
+	docker tag "$$($(COMPOSE) config --images | grep '^meridian-gateway:' | head -1)" meridian-gateway:$$(git rev-parse --short HEAD)
+	docker image ls meridian-gateway
 
-up:  ## (M8) Start the API and both workers
-	$(COMPOSE) up -d gateway-api sftp-poller webhook-dispatcher
+migrate:  ## (M8) Apply additive migrations
+	$(COMPOSE) run --rm gateway-migrate
+
+up:  ## (M8) Start the API and both workers (after make image and make migrate)
+	$(COMPOSE) up -d --no-build gateway-api sftp-poller webhook-dispatcher
 
 down:  ## Stop this project's containers (keeps volumes)
 	$(COMPOSE) down --remove-orphans
@@ -125,7 +134,9 @@ down:  ## Stop this project's containers (keeps volumes)
 logs:  ## Follow logs (S=<service>)
 	$(COMPOSE) logs -f --tail=100 $(S)
 
-schemathesis:  ## (M8) Conformance tests against the running API
+schemathesis:  ## (M8) Conformance tests against the running API (clears the previous run's fuzz subscriptions first)
+	@$(COMPOSE) exec -T postgres psql -qAt -U gateway -d gateway \
+	  -c "DELETE FROM webhook_subscriptions WHERE url LIKE 'https://webhook-sink:9000/webhooks/fuzz%'" >/dev/null
 	uvx schemathesis==4.28.0 run contracts/openapi.yaml --url http://localhost:8000 -H "X-API-Key: dev-shipper-key" --checks all
 
 audit:  ## Known-vulnerability scan of the locked dependencies

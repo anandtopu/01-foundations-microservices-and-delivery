@@ -1,6 +1,16 @@
-# P01 lab topology. M2: Postgres + the three legacy stand-ins. M8 adds gateway-api, sftp-poller and webhook-dispatcher.
+# P01 lab topology. M2: Postgres + the three legacy stand-ins. M8: gateway-api, sftp-poller and
+# webhook-dispatcher, all from ONE image (meridian-gateway) with different commands.
 # The project name scopes every container, network and volume, so `docker compose down -v` touches only this lab.
 name: meridian
+
+# Shared by the gateway services below (YAML anchors; `x-` keys are ignored by Compose itself).
+x-gateway-database-url: &database-url postgresql://${POSTGRES_USER:-gateway}:${POSTGRES_PASSWORD:-gateway}@postgres:5432/${POSTGRES_DB:-gateway}
+x-gateway-hardening: &hardening
+  read_only: true                     # nothing writes to the image's filesystem
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
 
 services:
   postgres:
@@ -73,7 +83,82 @@ services:
       timeout: 3s
       retries: 20
 
+  # --- the gateway (M8): one image, four uses ------------------------------------------------------
+  # Migrations run ONCE, first, as their own container; the three processes start only after it
+  # exits 0 (PR #6 review: a healthy API proved nothing about the schema, and made the workers wait
+  # on the API). Each process gets only the environment and secrets it reads.
+  gateway-migrate:
+    image: meridian-gateway:${GATEWAY_TAG:-latest}  # spec section 6: roll back with GATEWAY_TAG=<older sha>
+    command: ["python", "-m", "gateway.migrate"]
+    environment:
+      DATABASE_URL: *database-url
+    depends_on:
+      postgres: { condition: service_healthy }
+    <<: *hardening
+    restart: "no"
+
+  gateway-api:
+    build:
+      context: .
+      secrets: [build_ca]
+    image: meridian-gateway:${GATEWAY_TAG:-latest}
+    environment:
+      DATABASE_URL: *database-url
+      SOAP_BASE_URL: http://soap-mock:8080
+      SFTP_HOST: sftp              # /readyz only: a banner probe, no credentials
+      SFTP_PORT: "22"
+      # LAB ONLY (difference 37): subscriptions may name the sink on the Compose network.
+      WEBHOOK_DEV_ALLOW_HOSTS: webhook-sink
+    ports:
+      - "127.0.0.1:8000:8000"      # the lab's dev keys are weak: never on the LAN (PR #6 review)
+    depends_on:
+      gateway-migrate: { condition: service_completed_successfully }
+      sftp: { condition: service_healthy }
+      soap-mock: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    <<: *hardening
+
+  sftp-poller:
+    image: meridian-gateway:${GATEWAY_TAG:-latest}
+    command: ["python", "-m", "gateway.ingest.poller"]
+    environment:
+      DATABASE_URL: *database-url
+      SFTP_HOST: sftp
+      SFTP_PORT: "22"
+      SFTP_POLL_INTERVAL_S: ${SFTP_POLL_INTERVAL_S:-60}
+    secrets: [gateway_ed25519, known_hosts]   # the only holder of the SFTP key
+    depends_on:
+      gateway-migrate: { condition: service_completed_successfully }
+      sftp: { condition: service_healthy }
+    <<: *hardening
+
+  webhook-dispatcher:
+    image: meridian-gateway:${GATEWAY_TAG:-latest}
+    command: ["python", "-m", "gateway.webhooks.dispatcher"]
+    environment:
+      DATABASE_URL: *database-url
+      WEBHOOK_MAX_AGE: ${WEBHOOK_MAX_AGE:-72h}
+      # LAB ONLY (differences 37/38): the sink's name, and the lab CA its certificate chains to.
+      WEBHOOK_DEV_ALLOW_HOSTS: webhook-sink
+      WEBHOOK_CA_BUNDLE: /run/secrets/webhook_ca
+    secrets: [webhook_ca]                     # the only process that trusts the lab CA
+    depends_on:
+      gateway-migrate: { condition: service_completed_successfully }
+    <<: *hardening
+
 secrets:
+  # Runtime secrets (gitignored secrets/, created by `make keys` / `make certs` / `make pin-hostkey`).
+  # Compose mounts them read-only at /run/secrets/<name>; the key is chowned to uid 10001 by make keys.
+  gateway_ed25519:
+    file: ./secrets/gateway_ed25519
+  known_hosts:
+    file: ./secrets/known_hosts
+  webhook_ca:
+    file: ./secrets/webhook-ca.crt
   # Optional CA bundle for a TLS-inspecting egress proxy, used ONLY at image build time (see mocks/Dockerfile.python).
   # Set BUILD_CA_BUNDLE in .env on the cloud VM; elsewhere it defaults to an empty file.
   build_ca:
