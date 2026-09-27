@@ -15,6 +15,14 @@ x-gateway-otel: &otel
   OTEL_TRACES_EXPORTER: otlp
   OTEL_METRICS_EXPORTER: otlp
   OTEL_LOGS_EXPORTER: none
+  # Measured in M9 (reads at 200 req/s, same image): exporting EVERY trace made p95 2.23 s, because
+  # the batch span processor encodes and ships hundreds of spans per flush inside the process,
+  # holding the GIL (no tracing: p95 3.4 ms). 10% head sampling, 500 ms flushes and no probe spans:
+  # p95 32 ms. Metrics (the SLIs) still see every request; only traces are sampled.
+  OTEL_TRACES_SAMPLER: parentbased_traceidratio
+  OTEL_TRACES_SAMPLER_ARG: "0.1"
+  OTEL_BSP_SCHEDULE_DELAY: "500"
+  OTEL_PYTHON_FASTAPI_EXCLUDED_URLS: "healthz,readyz"
 x-gateway-hardening: &hardening
   read_only: true                     # nothing writes to the image's filesystem
   tmpfs: [/tmp]
