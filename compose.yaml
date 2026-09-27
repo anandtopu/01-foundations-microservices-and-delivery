@@ -5,6 +5,24 @@ name: meridian
 
 # Shared by the gateway services below (YAML anchors; `x-` keys are ignored by Compose itself).
 x-gateway-database-url: &database-url postgresql://${POSTGRES_USER:-gateway}:${POSTGRES_PASSWORD:-gateway}@postgres:5432/${POSTGRES_DB:-gateway}
+# M9 (section 8): every gateway process runs under `opentelemetry-instrument` and exports OTLP to
+# otel-lgtm (P04 replaces the target). Stable HTTP metric names; metrics every 5 s for the demo.
+x-gateway-otel: &otel
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-lgtm:4317}
+  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+  OTEL_SEMCONV_STABILITY_OPT_IN: http
+  OTEL_METRIC_EXPORT_INTERVAL: "5000"
+  OTEL_TRACES_EXPORTER: otlp
+  OTEL_METRICS_EXPORTER: otlp
+  OTEL_LOGS_EXPORTER: none
+  # Measured in M9 (reads at 200 req/s, same image): exporting EVERY trace made p95 2.23 s, because
+  # the batch span processor encodes and ships hundreds of spans per flush inside the process,
+  # holding the GIL (no tracing: p95 3.4 ms). 10% head sampling, 500 ms flushes and no probe spans:
+  # p95 26.05 ms over 5 min. Metrics (the SLIs) still see every request; only traces are sampled.
+  OTEL_TRACES_SAMPLER: parentbased_traceidratio
+  OTEL_TRACES_SAMPLER_ARG: "0.1"
+  OTEL_BSP_SCHEDULE_DELAY: "500"
+  OTEL_PYTHON_FASTAPI_EXCLUDED_URLS: "healthz,readyz"
 x-gateway-hardening: &hardening
   read_only: true                     # nothing writes to the image's filesystem
   tmpfs: [/tmp]
@@ -33,7 +51,7 @@ services:
   sftp:
     build: ./mocks/sftp
     ports:
-      - "2222:22"
+      - "127.0.0.1:2222:22"     # the lab SFTP drop: host tools only (PR #7 review)
     volumes:
       - sftp-hostkeys:/var/lib/sftp-hostkeys          # stable host identity across rebuilds
       # The drop directory. We play the IBM i job by writing files into ./var/sftp-drop on the host.
@@ -56,7 +74,7 @@ services:
       SOAP_MOCK_LATENCY_MS: ${SOAP_MOCK_LATENCY_MS:-300}
       SOAP_MOCK_MAX_CONCURRENCY: "5"
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"   # /__faults is unauthenticated: never on the LAN (PR #7 review)
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/__health', timeout=2)"]
       interval: 3s
@@ -72,7 +90,7 @@ services:
     environment:
       PORT: "9000"
     ports:
-      - "9000:9000"
+      - "127.0.0.1:9000:9000"   # the lab webhook sink: host tools only (PR #7 review)
     volumes:
       # M7: HTTPS only. The lab CA and this cert come from `make certs` (gitignored secrets/); the
       # image serves TLS whenever /certs/tls.crt exists. Only the dispatcher trusts the lab CA.
@@ -102,7 +120,10 @@ services:
       context: .
       secrets: [build_ca]
     image: meridian-gateway:${GATEWAY_TAG:-latest}
+    command: ["opentelemetry-instrument", "uvicorn", "gateway.app:app", "--host", "0.0.0.0", "--port", "8000", "--no-server-header"]
     environment:
+      <<: *otel
+      OTEL_SERVICE_NAME: gateway-api
       DATABASE_URL: *database-url
       SOAP_BASE_URL: http://soap-mock:8080
       SFTP_HOST: sftp              # /readyz only: a banner probe, no credentials
@@ -124,8 +145,10 @@ services:
 
   sftp-poller:
     image: meridian-gateway:${GATEWAY_TAG:-latest}
-    command: ["python", "-m", "gateway.ingest.poller"]
+    command: ["opentelemetry-instrument", "python", "-m", "gateway.ingest.poller"]
     environment:
+      <<: *otel
+      OTEL_SERVICE_NAME: sftp-poller
       DATABASE_URL: *database-url
       SFTP_HOST: sftp
       SFTP_PORT: "22"
@@ -138,8 +161,10 @@ services:
 
   webhook-dispatcher:
     image: meridian-gateway:${GATEWAY_TAG:-latest}
-    command: ["python", "-m", "gateway.webhooks.dispatcher"]
+    command: ["opentelemetry-instrument", "python", "-m", "gateway.webhooks.dispatcher"]
     environment:
+      <<: *otel
+      OTEL_SERVICE_NAME: webhook-dispatcher
       DATABASE_URL: *database-url
       WEBHOOK_MAX_AGE: ${WEBHOOK_MAX_AGE:-72h}
       # LAB ONLY (differences 37/38): the sink's name, and the lab CA its certificate chains to.
@@ -149,6 +174,15 @@ services:
     depends_on:
       gateway-migrate: { condition: service_completed_successfully }
     <<: *hardening
+
+  # --- observability (M9): Grafana + Prometheus + Tempo + Loki + an OTel Collector in one container.
+  # Pinned by digest (pulled via mirror.gcr.io). Lab only: Grafana on 127.0.0.1:3000 (admin/admin),
+  # Prometheus on 127.0.0.1:9090 for the gate's queries.
+  otel-lgtm:
+    image: grafana/otel-lgtm@sha256:b966ea107831d526d9eb8fe4d2d86c9e5731392fad9dce8296bcf2072031f07c
+    ports:
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:9090:9090"
 
 secrets:
   # Runtime secrets (gitignored secrets/, created by `make keys` / `make certs` / `make pin-hostkey`).

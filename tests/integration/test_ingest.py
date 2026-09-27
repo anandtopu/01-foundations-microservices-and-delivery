@@ -469,3 +469,102 @@ async def test_outbox_rows_commit_exactly_once_with_their_batch(
             )
             == 2450
         )
+
+
+# --- M9: the worker loop, the entry point, and the upsert's own owner guard ---------------------
+
+
+def sftp_cfg(remote_dir: str, **extra: Any) -> Settings:
+    base: dict[str, Any] = {
+        "database_url": TEST_URL,
+        "sftp_host": "localhost",
+        "sftp_port": 2222,
+        "sftp_host_key_alias": "sftp",
+        "sftp_key_path": ROOT / "secrets" / "gateway_ed25519",
+        "sftp_known_hosts": ROOT / "secrets" / "known_hosts",
+        "sftp_remote_dir": remote_dir,
+    }
+    return Settings(**(base | extra))
+
+
+async def test_run_once_and_main_ingest_the_drop(db: AsyncConnection) -> None:
+    """`python -m gateway.ingest.poller --once` end to end: the loop and the entry point."""
+    import asyncio
+    import sys
+
+    if not sftp_ready():
+        pytest.skip("sftp not running or host key not pinned (make mocks pin-hostkey)")
+    drop = ROOT / "var" / "sftp-drop" / "_e2e_run"
+    drop.mkdir(parents=True, exist_ok=True)
+    name = "SHPSTS_20260101_0100_run.csv"
+    (drop / name).write_bytes((CSV / "SHPSTS_20260924_0915.csv").read_bytes())
+    (drop / f"{name}.done").touch()
+    cfg = sftp_cfg("/outbound/shipments/_e2e_run")
+    try:
+        await poller.run(cfg, once=True)
+        assert await scalar(db, "SELECT count(*) FROM shipments") == 3
+        argv, get = sys.argv, poller.get_settings
+        sys.argv, poller.get_settings = ["poller", "--once"], lambda: cfg  # type: ignore[assignment]
+        try:
+            await asyncio.to_thread(poller.main)  # asyncio.run in its own thread: a fresh loop
+        finally:
+            sys.argv, poller.get_settings = argv, get  # type: ignore[assignment]
+        assert await scalar(db, "SELECT count(*) FROM ingested_files WHERE status = 'done'") == 1
+    finally:
+        for p in (drop / name, drop / f"{name}.done"):
+            p.unlink(missing_ok=True)
+        drop.rmdir()
+
+
+async def test_run_logs_and_keeps_polling_when_sftp_is_down(db: AsyncConnection) -> None:
+    """Outside --once, an unreachable drop is logged and retried next cycle; with --once it
+    surfaces (the operator asked for exactly one cycle)."""
+    import asyncio
+    import logging
+
+    down = sftp_cfg("/outbound/shipments", sftp_port=1, sftp_poll_interval_s=0.01)
+    with pytest.raises(OSError):
+        await poller.run(down, once=True)
+    retried = asyncio.Event()
+
+    class Count(logging.Handler):
+        failures = 0
+
+        def emit(self, record: logging.LogRecord) -> None:
+            if "poll failed" in record.getMessage():
+                Count.failures += 1
+                if Count.failures >= 2:  # it failed, logged, and came back for another cycle
+                    retried.set()
+
+    handler = Count()
+    logging.getLogger("gateway.ingest").addHandler(handler)
+    task = asyncio.create_task(poller.run(down, once=False))
+    try:
+        async with asyncio.timeout(10):
+            await retried.wait()
+    finally:
+        task.cancel()
+        logging.getLogger("gateway.ingest").removeHandler(handler)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_the_upsert_refuses_another_owner_even_if_the_owner_check_misses(
+    db: AsyncConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defense in depth (PR #6 review): the UPSERT's `WHERE s.client_id = EXCLUDED.client_id`
+    must refuse on its own, and the silent row must be dead-lettered, not lost."""
+    from gateway.ingest.model import parse_export
+
+    first = csv('"SHPGUARD","O1","ACME","P",1260924,1.00')
+    await ingest_bytes(db, remote("a.csv", first), first, batch_size=10)
+    (row,) = [r for r in parse_export(csv('"SHPGUARD","O1","BOLT","D",1260924,1.00'))]
+    assert isinstance(row, GoodRow)
+    monkeypatch.setattr(poller, "OWNERS", "SELECT NULL, NULL WHERE %s::text[] IS NULL")  # misses
+    async with db.transaction():
+        changed, refused, _ = await poller.apply_rows(db, [row], "guard.csv")
+    assert changed == []
+    assert [r.reason for r in refused] == ["owner change refused: 'ACME' -> 'BOLT'"]
+    assert await scalar(db, "SELECT client_id FROM shipments WHERE shipment_id = 'SHPGUARD'") == (
+        "ACME"
+    )

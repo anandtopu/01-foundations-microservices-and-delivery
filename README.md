@@ -257,6 +257,52 @@ Run the contract conformance tests (the M8 gate: expect zero failures). `schemat
 make schemathesis
 ```
 
+Observability (M9). `make up` also needs `otel-lgtm`: Grafana is on <http://127.0.0.1:3000> (admin/admin, then Explore and Prometheus), and Prometheus is on `127.0.0.1:9090`. Start it and check one of the six section 8 metrics:
+
+```bash
+docker compose up -d otel-lgtm
+```
+
+```bash
+curl -s localhost:9090/api/v1/query --data-urlencode 'query=gateway_ingest_rows_total'
+```
+
+The section 7 matrix (M9). Branch coverage on the gated packages (≥ 90%):
+
+```bash
+make cov
+```
+
+Reads at 200 req/s for 5 minutes (p95 < 150 ms):
+
+```bash
+k6 run load/reads.js
+```
+
+Chaos: kill the SOAP mock (the breaker opens and closes by itself), stop Postgres for 30 s, and SIGKILL the poller mid-way through a 20,000-row file. `scripts/m9/README.md` has the commands:
+
+```bash
+python3 scripts/m9/chaos_kill_soap.py
+```
+
+Known vulnerabilities in the locked dependencies (pip-audit), then in the image (Trivy pinned by digest; ARCHITECTURE difference 64; fails on any HIGH or CRITICAL):
+
+```bash
+make audit
+```
+
+```bash
+make scan
+```
+
+Roll back to an older image and forward again (spec section 6; both tags come from `make image`):
+
+```bash
+python3 scripts/m9/rollback.py <old-sha> <new-sha>
+```
+
+Runbooks are in `docs/runbooks/`, and the interview pitch and demo script with measured numbers are in `docs/INTERVIEW_NOTES.md`.
+
 List every other target:
 
 ```bash

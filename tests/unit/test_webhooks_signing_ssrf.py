@@ -183,3 +183,30 @@ async def test_guard_allows_nat64_of_a_public_address() -> None:
 async def test_guard_refuses_urls_the_client_would_read_differently(url: str) -> None:
     with pytest.raises(ValueError):
         await guard(url)
+
+
+@pytest.mark.parametrize(
+    ("name", "answers"),
+    [
+        ("internal.meridian.test", ["10.0.0.5"]),  # the spec's section 7 case
+        ("metadata.evil.test", ["169.254.169.254"]),
+        ("mixed.evil.test", ["93.184.216.34", "10.0.0.5"]),  # ONE private answer is enough
+        ("v6.evil.test", ["fd00::5"]),  # IPv6 ULA
+    ],
+)
+async def test_a_name_that_resolves_inside_is_refused(
+    monkeypatch: pytest.MonkeyPatch, name: str, answers: list[str]
+) -> None:
+    """The check is on what the NAME resolves to, not on the URL's text (spec section 7)."""
+    import asyncio
+    import socket
+
+    async def fake_getaddrinfo(host: str, *_a: object, **_k: object) -> list[object]:
+        assert host == name
+        fam = {True: socket.AF_INET6, False: socket.AF_INET}
+        return [(fam[":" in ip], socket.SOCK_STREAM, 6, "", (ip, 443)) for ip in answers]
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    with pytest.raises(ValueError, match="non-public"):
+        await guard(f"https://{name}/hook")

@@ -415,3 +415,101 @@ def test_the_production_client_does_not_follow_redirects() -> None:
     client = dispatcher.http_client(CFG)
     assert client.follow_redirects is False
     assert client.timeout.read == CFG.webhook_timeout_s
+
+
+# --- M9: the worker loop, the entry point, isolation and the lab CA ----------------------------
+
+
+async def test_run_once_and_main_deliver_everything_due(
+    api_pool: AsyncConnectionPool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`python -m gateway.webhooks.dispatcher --once`: drain, publish the backlog gauge, exit."""
+    import sys
+
+    await seed(api_pool, n=3)
+    monkeypatch.setattr(
+        dispatcher, "http_client", lambda _cfg: http(lambda _r: httpx.Response(204))
+    )
+    await dispatcher.run(CFG, once=True)
+    assert await one(
+        api_pool, "SELECT count(*) FROM webhook_deliveries WHERE status = 'delivered'"
+    ) == (3,)
+    await seed(api_pool, n=1)
+    monkeypatch.setattr(sys, "argv", ["dispatcher", "--once"])
+    monkeypatch.setattr(dispatcher, "get_settings", lambda: CFG)
+    await asyncio.to_thread(dispatcher.main)  # asyncio.run in its own thread: a fresh loop
+    assert await one(
+        api_pool, "SELECT count(*) FROM webhook_deliveries WHERE status = 'delivered'"
+    ) == (4,)
+
+
+async def test_run_logs_and_keeps_going_when_the_database_is_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead dispatcher stops webhooks for every tenant, so outside --once any error is logged
+    and the next cycle tries again; with --once it surfaces."""
+    import logging
+
+    down = Settings(database_url="postgresql://gateway:gateway@127.0.0.1:1/none",
+                    webhook_poll_interval_s=0.01)  # fmt: skip
+    monkeypatch.setattr(
+        dispatcher, "http_client", lambda _cfg: http(lambda _r: httpx.Response(204))
+    )
+    with pytest.raises(Exception):  # noqa: B017 - psycopg's OperationalError, whatever its subclass
+        await dispatcher.run(down, once=True)
+    retried = asyncio.Event()
+
+    class Count(logging.Handler):
+        failures = 0
+
+        def emit(self, record: logging.LogRecord) -> None:
+            if "dispatch failed" in record.getMessage():
+                Count.failures += 1
+                if Count.failures >= 2:
+                    retried.set()
+
+    handler = Count()
+    logging.getLogger("gateway.webhooks").addHandler(handler)
+    task = asyncio.create_task(dispatcher.run(down, once=False))
+    try:
+        async with asyncio.timeout(10):
+            await retried.wait()
+    finally:
+        task.cancel()
+        logging.getLogger("gateway.webhooks").removeHandler(handler)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_one_failed_record_does_not_lose_the_rest_of_the_batch(
+    api_pool: AsyncConnectionPool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await seed(api_pool, n=3)
+    real = dispatcher.record
+    calls = 0
+
+    async def flaky(*args: Any) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("a bug while recording one row")
+        return await real(*args)
+
+    monkeypatch.setattr(dispatcher, "record", flaky)
+    async with http(lambda _r: httpx.Response(204)) as client:
+        assert await run_once(api_pool, client) == 3
+    assert await one(
+        api_pool, "SELECT count(*) FROM webhook_deliveries WHERE status = 'delivered'"
+    ) == (2,)
+
+
+def test_the_lab_ca_is_trusted_only_when_configured() -> None:
+    """The dispatcher adds the lab CA to the system store only when WEBHOOK_CA_BUNDLE is set."""
+    from pathlib import Path
+
+    ca = Path(__file__).resolve().parents[2] / "secrets" / "webhook-ca.crt"
+    if not ca.exists():
+        pytest.skip("no lab CA (make certs)")
+    ssl_plain = dispatcher.tls_context(CFG)
+    ssl_lab = dispatcher.tls_context(Settings(**(CFG.model_dump() | {"webhook_ca_bundle": ca})))
+    assert len(ssl_lab.get_ca_certs()) == len(ssl_plain.get_ca_certs()) + 1

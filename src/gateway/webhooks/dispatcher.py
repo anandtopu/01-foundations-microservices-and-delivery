@@ -33,6 +33,7 @@ import psycopg
 from psycopg import AsyncConnection
 from psycopg.types.json import Jsonb
 
+from gateway import telemetry
 from gateway.config import Settings, get_settings
 from gateway.webhooks import ssrf
 from gateway.webhooks.signing import sign
@@ -58,7 +59,7 @@ UPDATE webhook_deliveries d
   FROM due, webhook_subscriptions s
  WHERE d.delivery_id = due.delivery_id AND s.subscription_id = d.subscription_id
 RETURNING d.delivery_id, d.event_type, d.payload, d.attempts, d.window_start,
-          s.subscription_id, s.url, s.secret, s.status, d.next_attempt_at
+          s.subscription_id, s.url, s.secret, s.status, d.next_attempt_at, d.created_at
 """
 
 # A failed attempt, in ONE guarded statement. The max age is checked by the database clock
@@ -89,6 +90,7 @@ class Job:
     secret: str
     subscription_status: str
     lease: datetime  # fencing token: the claim's next_attempt_at
+    created_at: datetime | None = None  # the outbox row: when the event happened (M9 age metric)
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +151,16 @@ async def _send(client: httpx.AsyncClient, job: Job, cfg: Settings) -> Outcome:
 
 async def record(conn: AsyncConnection, job: Job, outcome: Outcome, cfg: Settings) -> str:
     """Persist one attempt's outcome; returns a short log description."""
+    desc = await persist(conn, job, outcome, cfg)
+    # M9: the 60 s delivery SLI, event -> receiver's 2xx. Recorded only once the row has committed,
+    # so a failed COMMIT (the row is redelivered) cannot put the same delivery in twice.
+    if outcome.kind == "delivered" and job.created_at is not None:
+        age = datetime.now(job.created_at.tzinfo) - job.created_at
+        telemetry.webhook_delivery_age.record(max(0.0, age.total_seconds()))
+    return desc
+
+
+async def persist(conn: AsyncConnection, job: Job, outcome: Outcome, cfg: Settings) -> str:
     async with conn.transaction():
         if outcome.kind == "delivered":
             # The receiver has it, whatever happened to the row meanwhile: delivered wins.
@@ -228,7 +240,10 @@ async def claim(conn: AsyncConnection, n: int) -> list[Job]:
     async with conn.transaction():  # the lease commits before any HTTP call
         cur = await conn.execute(CLAIM, {"n": n, "lease": CLAIM_LEASE_S})
         rows = await cur.fetchall()
-    return [Job(str(r[0]), r[1], r[2], r[3], r[4], str(r[5]), r[6], r[7], r[8], r[9]) for r in rows]
+    return [
+        Job(str(r[0]), r[1], r[2], r[3], r[4], str(r[5]), r[6], r[7], r[8], r[9], r[10])
+        for r in rows
+    ]
 
 
 async def dispatch_once(conn: AsyncConnection, client: httpx.AsyncClient, cfg: Settings) -> int:
@@ -258,13 +273,35 @@ async def dispatch_once(conn: AsyncConnection, client: httpx.AsyncClient, cfg: S
     return len(jobs)
 
 
-def http_client(cfg: Settings) -> httpx.AsyncClient:
+def tls_context(cfg: Settings) -> ssl.SSLContext:
     # The lab sink's self-signed certificate is trusted by the DISPATCHER only (an extra CA on top
     # of the system store), never by the rest of the gateway.
     ctx = ssl.create_default_context()
     if cfg.webhook_ca_bundle:
         ctx.load_verify_locations(cfg.webhook_ca_bundle)
-    return httpx.AsyncClient(verify=ctx, follow_redirects=False, timeout=cfg.webhook_timeout_s)
+    return ctx
+
+
+def http_client(cfg: Settings) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        verify=tls_context(cfg), follow_redirects=False, timeout=cfg.webhook_timeout_s
+    )
+
+
+DEAD_LETTER_GAUGE_EVERY_S = 30.0
+
+
+async def publish_dead_letters(conn: AsyncConnection) -> None:
+    """M9: gateway.dead_letters.open by kind (the ops backlog). Kinds with none report 0."""
+    async with conn.transaction():
+        cur = await conn.execute(
+            """SELECT k.kind, count(d.dead_letter_id)
+                 FROM (VALUES ('row'), ('webhook')) AS k(kind)
+                 LEFT JOIN dead_letters d ON d.kind = k.kind AND d.resolved_at IS NULL
+                GROUP BY k.kind"""
+        )
+        for kind, n in await cur.fetchall():
+            telemetry.dead_letters_open.set(n, {"kind": kind})
 
 
 async def run(cfg: Settings, *, once: bool) -> None:
@@ -273,12 +310,19 @@ async def run(cfg: Settings, *, once: bool) -> None:
         cfg.webhook_poll_interval_s, cfg.webhook_max_age, cfg.webhook_base_delay_s,
         cfg.webhook_max_delay_s, sorted(cfg.dev_allow_hosts) or "none",
     )  # fmt: skip
+    next_gauge_at = 0.0
     async with http_client(cfg) as client:
         while True:
             try:
                 async with await AsyncConnection.connect(cfg.database_url) as conn:
-                    while await dispatch_once(conn, client, cfg):
-                        pass  # drain everything due before sleeping
+                    while True:  # drain everything due before sleeping
+                        more = await dispatch_once(conn, client, cfg)
+                        # Inside the drain too: a long backlog must not leave the gauge stale.
+                        if time.monotonic() >= next_gauge_at:
+                            await publish_dead_letters(conn)
+                            next_gauge_at = time.monotonic() + DEAD_LETTER_GAUGE_EVERY_S
+                        if not more:
+                            break
             except Exception as err:
                 if once:
                     raise

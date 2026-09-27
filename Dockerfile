@@ -48,7 +48,14 @@ RUN find /app/.venv -name '*.so*' -type f -exec strip --strip-unneeded {} + && \
 
 # --- 3. the runtime image --------------------------------------------------------------------------
 FROM python:3.14-alpine
-RUN adduser -D -H -u 10001 -s /sbin/nologin gateway
+# pip is never used at runtime, and it carried the image's only scanner findings (M9, Trivy 0.74.0:
+# its vendored msgpack 1.1.2, GHSA-6v7p-g79w-8964 HIGH, and setuptools 70.3.0 / pkg_resources,
+# CVE-2025-47273 HIGH + CVE-2026-59890 MEDIUM). Not importable by the app (the venv does not see the
+# base site-packages), but a scanner cannot know that and an attacker with a shell could use it.
+# Removed with rm, not `pip uninstall`: running pip would write ~5 MB of .pyc into this layer.
+RUN rm -rf /usr/local/lib/python3.14/site-packages/pip /usr/local/lib/python3.14/site-packages/pip-*.dist-info \
+           /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.14 && \
+    adduser -D -H -u 10001 -s /sbin/nologin gateway
 WORKDIR /app
 COPY --from=strip /app/.venv /app/.venv
 COPY migrations ./migrations
