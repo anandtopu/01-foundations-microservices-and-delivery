@@ -1362,3 +1362,172 @@ $ psql: fuzz subscriptions -> 23 (all https://webhook-sink:9000/webhooks/fuzz), 
 - **A status-code mapping is a statement about *whose fault* something is.** "Change your request" (4xx) and "we are broken" (5xx) drive different behaviour in the client and in our alerting. Map from the cause, not from the exception class name.
 - **A health probe is also an attack surface,** and it talks to your dependencies on everyone's behalf. Make it cheap and cached, and don't let it reveal anything.
 - **Timestamps as cursors need a commit order.** With several writers, `now()` gives start order, and readers see commit order; serialising the writers, or stamping after the lock, is what makes the two agree.
+
+---
+
+## M9 — Deploy, full test pass, demo prep   (2026-09-27, session 3)
+
+**Goal / requirement served:** the build prompt's M9, in five parts:
+- a clean-state deploy following spec section 6;
+- the section 7 test matrix, with a pass/fail table against every threshold;
+- OpenTelemetry with the section 8 metrics exported to `grafana/otel-lgtm`, plus the three runbooks;
+- the rollback demo;
+- `docs/INTERVIEW_NOTES.md`, using only numbers we measured.
+
+**What we built:**
+- `src/gateway/telemetry.py`: the six section 8 instruments, using only the OpenTelemetry API (no-op without an SDK).
+  - The Bulkhead records `gateway.upstream.inflight`.
+  - The CircuitBreaker records `gateway.circuit.state` on every transition.
+  - The poller records `gateway.ingest.rows` (by `outcome`) and `gateway.ingest.lag` (the `.done` mtime → the commit).
+  - The dispatcher records `gateway.webhook.delivery.age` (outbox row → 2xx) and `gateway.dead_letters.open` (by `kind`, every 30 s).
+- `compose.yaml`:
+  - all three processes run under `opentelemetry-instrument`, with the stable HTTP semantic conventions and OTLP to an `otel-lgtm` pinned by digest;
+  - traces are head-sampled at 10% (difference 63).
+- `docs/runbooks/`: circuit open, host-key mismatch, dead-letter spike. Each has the PromQL, the commands and the "do not" list.
+- `load/reads.js`: reads at a constant *arrival* rate (a closed loop would hide latency by slowing down).
+- `scripts/m9/`: the chaos exercises and the rollback, as re-runnable scripts.
+- Tests:
+  - `tests/integration/test_telemetry.py` (breaker state 0→2→1→0, in-flight peak 4, delivery age, dead-letter backlog);
+  - worker-loop and entry-point tests for both workers;
+  - the upsert's own owner guard;
+  - SSRF for a *name* that resolves to 10.0.0.5.
+- Dockerfile: `pip` removed from the runtime image (difference 65).
+- Makefile:
+  - `make image` never SHA-tags a build of uncommitted changes;
+  - `make schemathesis` removes its fuzz subscriptions afterwards too.
+- `docs/INTERVIEW_NOTES.md`.
+
+**Commands run, in order:**
+1. **The VM had restarted twice** (Docker down both times). I restored it with `bash scripts/cloud-setup.sh`.
+2. **Clean state (you approved it):** `docker compose down -v --remove-orphans` for this project only. Both volumes were removed, then a new SSH key was generated (CLAUDE.md: regenerate every session).
+3. **Spec section 6, in order:**
+   - `make mocks` (four healthy);
+   - the spec's pin command (`sftp SHA256:3Q+CTsEW…`);
+   - the spec's migrate command, verbatim;
+   - `make dev-keys`;
+   - `docker compose up -d gateway-api sftp-poller webhook-dispatcher`;
+   - `/readyz`;
+   - the smoke test, twice.
+4. **Observability:** telemetry code and tests; `otel-lgtm` pulled via `mirror.gcr.io` (3.66 GB) and pinned by digest; `make image`; traffic; Prometheus queries.
+5. **The section 7 matrix** (the table below). Two rows failed on the first try and were fixed ("What broke" 1–3).
+6. **Rollback demo:** `python3 scripts/m9/rollback.py 7e01ebd f76b9b2`.
+7. **Clean SLI measurement:** a 2,000-row file, with freshness and delivery age computed from the database rows.
+8. `make check` → **412 passed**, ruff and mypy clean.
+
+**Verification: the deploy (spec section 6, from zero):**
+
+```text
+== down -v
+ Volume meridian_sftp-hostkeys Removed
+ Volume meridian_pgdata Removed
+== pin host key (spec section 6, verbatim)
+256 SHA256:3Q+CTsEW9q3kM/dVxlDSlsOka01N1TosBKoB7gcO3IA sftp
+== migrate (spec section 6, verbatim): docker compose run --rm gateway-api python -m gateway.migrate
+gateway-migrate  applied 0001_init / 0002_auth_idempotency_quotes / 0003_webhooks / 0004_replay_audit_key
+applied 0 migration(s): none pending          <- the spec's command; its dependency had just applied all 4
+== readyz
+{"status":"ready","db":"ok","sftp":"ok","soap_circuit":"closed"}      <- exactly the spec's expected output
+== smoke 1 -> 201 {"quote_id":"9ccd4509-…","total_charge":"974.56",…}
+== smoke 2 -> idempotent-replayed: true; bodies: byte-identical
+== mock stats {"calls":1,…}
+```
+
+**Verification: the section 7 matrix.** Every value was measured on this VM; the first failing attempts are shown as well.
+
+| Layer | Threshold (spec) | Measured | Result |
+|---|---|---|---|
+| Unit + golden | 100% pass; branch coverage ≥ 90% on `ingest/`, `resilience.py`, `webhooks/` | 412 passed. Coverage **96%** (poller 95%, dispatcher 97%, resilience 97%, model 97%, ssrf 91%). *First run: 88% (dispatcher 77%, poller 85%): FAIL.* | **PASS** |
+| Integration | 99% of rows visible within 5 min; a re-dropped file creates zero duplicates | 19,960 of 19,960 good rows of a 20,000-row file queryable 14 s after the drop, despite a SIGKILL. Re-drop: shipments / dead letters / deliveries **20,580 / 253 / 6,755 before and after** (`skipped: this content (sha256) was already ingested`) | **PASS** |
+| Contract | Schemathesis zero failures | **3,125 of 3,125** passed (seed 1066…), against the instrumented M9 stack; no external subscriptions created | **PASS** |
+| Load: reads | 200 req/s for 5 min, p95 < 150 ms | **p95 26.05 ms**, p90 7.8 ms, max 166 ms; 60,002 requests at 199.99/s; 0 errors, 0 dropped. *First run (every trace exported): p95 2.23 s, 8,493 dropped: FAIL.* | **PASS** (at the full 200/s, not scaled) |
+| Load: quotes | 50 VUs at 2.8 s mock latency; the mock never sees > 4 concurrent; non-503 errors < 0.1% | `peak_concurrency` **4**; 88 × 201 and 10,741 × 503 (p95 317 ms), all with `Retry-After`; **0** other errors | **PASS** |
+| Chaos: kill soap-mock | the breaker opens in < 10 s and re-closes | open **1.2 s** after the kill (`503 upstream-busy`, then `503 circuit-open`); re-closed **30.5 s** after the restart; Prometheus `max_over_time(gateway_circuit_state[5m]) = 2` | **PASS** |
+| Chaos: stop Postgres 30 s | (the spec lists the experiment) | 35 s down: `/readyz` 503 ×5, reads 503 ×4 (plus one hitting my probe's own 5 s timeout, since the pool waits 5 s); **0 × 500**; ready **0.6 s** after it returned; **0 restarts**; both workers logged and resumed | **PASS** |
+| Chaos: poller restart mid 20k file | the file is ingested exactly once | SIGKILL at checkpoint line **3,001** with the next batch blocked uncommitted; `resuming after line 3001`; done 8.5 s later. The file row reads `done, 20001, 19960, 40`; shipments **19,960 / 19,960 distinct**; dead letters **40 / 40**; `shipment.created` **6,597 / 6,597** = the ACME shipments | **PASS** |
+| Security: SSRF, XXE | every case blocked | 66 of 66: loopback, RFC 1918, `169.254.169.254`, `[::1]`, NAT64, a *name* resolving to `10.0.0.5`, a `302` to metadata, XXE and billion-laughs (`DTDForbidden`) | **PASS** |
+| Security: `pip-audit` | no known vulnerabilities | `No known vulnerabilities found` (runtime lock) | **PASS** |
+| Security: image scan | zero critical CVEs | Trivy 0.74.0 (digest-pinned): **0** findings of any severity across Alpine and 53 Python packages. *First scan: 0 critical, but 2 HIGH + 1 MEDIUM in the base image's pip; removed.* | **PASS** |
+
+**Section 8 metrics in Prometheus** (queried after traffic, each from its own service):
+
+```text
+gateway_upstream_inflight                   gateway-api          0   (max_over_time 1 h: 4)
+gateway_circuit_state                       gateway-api          0   (2 during chaos 1)
+gateway_ingest_rows_total                   sftp-poller          upserted=195, dead_lettered=5, duplicate=0
+gateway_ingest_lag_seconds_count            sftp-poller          1
+gateway_webhook_delivery_age_seconds_count  webhook-dispatcher   68
+gateway_dead_letters_open                   webhook-dispatcher   row=213, webhook=0
+http_server_request_duration_seconds_count  gateway-api          (the stable HTTP name: OTEL_SEMCONV_STABILITY_OPT_IN=http)
+```
+
+**Clean SLI measurement** (one 2,000-row file):
+- freshness, `.done` → committed: **4.3 s**, with the demo's 5 s poll;
+- webhook delivery age, 657 of 657 delivered: **p50 2.75 s, p99 4.53 s**, max 4.56 s (SLI: 60 s).
+
+**Rollback demo** (spec section 6: `GATEWAY_TAG=<older sha> docker compose up -d …`):
+
+```text
+before: ['meridian-gateway:dev']
+GATEWAY_TAG=7e01ebd: ready 20.4 s after `compose up`; running ['meridian-gateway:7e01ebd']; health probes ok/failed 16/197
+GATEWAY_TAG=f76b9b2: ready 20.6 s after `compose up`; running ['meridian-gateway:f76b9b2']; health probes ok/failed 15/200
+smoke replay after roll-forward: 201
+(marker: 7e01ebd has pip in its base site-packages, f76b9b2 does not)
+```
+
+The rollback works with no down-migration, since migrations are additive. With one replica it is **not** zero-downtime: about 20 s unavailable each way (difference 66).
+
+**What broke and how we fixed it:**
+1. *Coverage was 88% against a 90% gate.*
+   - *Evidence:* the misses were concentrated in the dispatcher's and the poller's `run()` loop and `main()` (lines 295–330 and 402–430). No test had ever entered them.
+   - *Fix:* real tests, not exclusions:
+     - `run(once=True)` and `main()` for both workers;
+     - "logs and keeps going outside `--once`" (waiting on a log event, not a sleep loop);
+     - per-job record isolation;
+     - the lab-CA client;
+     - the upsert's own owner guard. That branch was nearly unreachable after the PR #6 writer lock, so the test forces the owner check to miss.
+   - *Result:* 96%.
+2. *The read SLO failed: p95 2.23 s at 200 req/s, 8,493 iterations dropped.*
+   - *Hypothesis:* CPU saturation.
+   - *Evidence against it:* at 50 req/s the median was 4 ms, yet p95 was 200 ms at 46% CPU. That is periodic stalls, not load.
+   - *Bisection* with the same image on side ports:
+     - no instrumentation: 3.5 ms (100/s) and 3.4 ms (200/s);
+     - traces off: 4.6 / 4.8 ms;
+     - metrics off: 311 ms at 100/s.
+   - *Root cause:* the batch span processor encodes and exports spans in-process while holding the GIL, so requests queue behind every flush.
+   - *Fix:* 10% head sampling, 500 ms flushes, no probe spans. The 5-minute re-run gave **26 ms**.
+   - *Lesson:* instrumentation is a dependency with a cost; measure it like one.
+3. *The image scan: Grype could not load its database.* The allowlist answers **403 for `grype.anchore.io`**; that's the domain to add under Environment settings → Network access if Grype is wanted. Trivy reads its database from `mirror.gcr.io/aquasec/trivy-db`, which this lab can reach. Its first scan found the base image's pip (2 HIGH, 1 MEDIUM). Nothing needs pip, so it was removed, and the rescan came back clean.
+4. *Removing pip with `pip uninstall` grew the image 179 → 186 MB.* Running pip wrote about 5 MB of `.pyc` into the new layer; a deletion layer should be almost empty. `rm -rf` gives a 57 kB layer, back to 179 MB.
+5. *A mislabelled image tag.* `make image` ran while the Dockerfile fix was uncommitted and tagged that build `:25c9376`, a commit that doesn't contain the fix. A rollback to it would have run code that commit doesn't have. I removed the tag, and `make image` now refuses to SHA-tag a build from a dirty tree.
+6. *A wrong marker in my rollback script.* `python -c "import pip"` inside the container failed for **both** images: the venv's interpreter can't see the base image's site-packages (the same reason those CVEs were unreachable). It now checks the file.
+7. *407 webhook deliveries left retrying.* The contract run's subscriptions (hook-confined to the lab sink since PR #6) kept receiving events the sink couldn't verify, because it doesn't know their secrets. `make schemathesis` now cleans up after the run as well. Separately, `make cov` ran the M2 sink tests, which replaced the sink's secret; 90 quote events waited until I restored it. Both are lab state, not product bugs; the dispatcher retried correctly throughout.
+
+**Known limits:**
+- **Freshness** was measured with the demo's 5 s poll. In production the 60 s poll plus ingest time bounds it, which is inside the 5-minute SLI but not "4 s".
+- **Load** was measured on one 4-CPU VM, with k6 on the same host. The numbers show headroom, not capacity planning.
+- **The Postgres chaos** showed a 5 s pool wait before the `503`, so clients with shorter timeouts see their own timeout first. A shorter pool wait for reads is the tuning knob.
+- **The alerts are PromQL in the runbooks,** not loaded rules (difference 67).
+
+**Cloud vs real customer environment:** at Meridian:
+- the stack runs as ≥ 2 replicas behind a load balancer, with readiness-gated rolling deploys, which removes the 20 s rollback gap;
+- telemetry goes to the platform's collector (P04), with tail-based sampling there instead of head sampling in-process;
+- the image is scanned and signed in CI, with digest-pinned tools and an SBOM;
+- chaos runs as scheduled game days against a staging copy, never against the production database;
+- the fuzzer and the ops-key replay run only against expendable environments.
+
+**Check yourself:**
+1. With every trace exported, why did a 4 ms request become a 2-second one, when the CPU was only half busy?
+2. The 20k-row chaos test takes an advisory lock before killing the poller. What would "just `docker kill` it after 2 seconds" have proven, and what not?
+3. Trivy reported 2 HIGH CVEs in packages our code cannot import. Why remove them anyway, rather than mark them as not applicable?
+
+<details><summary>answers</summary>
+
+1. The batch span processor's export runs inside the API process: it encodes a few hundred spans to protobuf and sends them over gRPC while holding Python's GIL. Every request that arrives during a flush waits for it. The average CPU was low, but the *pause* was long, and a p95 measures exactly those pauses. Sampling at 10% cuts the spans per flush by 10×, and 500 ms flushes make each pause shorter.
+2. A timed kill is a race. A batch commits in about 150 ms, so after 2 s the file might be finished (proving nothing) or stopped *between* batches (the easy case). The lock guarantees the hard case: the kill lands while a batch is open and uncommitted, so recovery must discard it and resume from the committed checkpoint. A test that can pass by luck is not evidence.
+3. "Not reachable" is a claim about today's code and today's `sys.path`, and an attacker with a shell in the container doesn't care about our venv. Removing pip costs nothing at runtime, turns an argument into a fact (a clean scan), and keeps the scan meaningful: a report that is always "3 known, ignored" hides the day a real one appears.
+</details>
+
+**What would break in production here:**
+- **Sampling that hides the rare failure.** At 10% head sampling, a 1-in-1,000 error has only a 10% chance of having a trace. Keep error traces with tail-based sampling at the collector, and use the metrics (100%) for the SLIs.
+- **One replica.** A deploy, a rollback or a crash is visible to shippers (20 s here). Run at least 2.
+- **Chaos without guard rails.** These scripts kill containers by name in *this* Compose project only. Pointed at a shared environment, they are an outage.

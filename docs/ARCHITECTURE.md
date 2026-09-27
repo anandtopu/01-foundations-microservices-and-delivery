@@ -35,7 +35,7 @@ This file tracks the architecture **as built**. It starts from the spec's sectio
 
 ## Lab topology (what actually runs)
 
-One Docker Compose project with 7 services on one bridge network. The trust boundary is simulated: the "data center" side is the three mocks.
+One Docker Compose project with 9 services on one bridge network (8 long-running, plus the one-shot `gateway-migrate`). The trust boundary is simulated: the "data center" side is the three mocks.
 
 | Compose service | Stands in for | Published port | Built in | Status |
 |---|---|---|---|---|
@@ -46,6 +46,7 @@ One Docker Compose project with 7 services on one bridge network. The trust boun
 | `gateway-api` | `meridian-gateway-api` | 8000 | M8 | built (M8): `meridian-gateway` image, default command (uvicorn); `make api-local` still runs it on the host |
 | `sftp-poller` | sftp-poller worker | none | M8 | built (M8): same image, `python -m gateway.ingest.poller`; the only service holding the SFTP key |
 | `webhook-dispatcher` | webhook-dispatcher worker | none | M8 | built (M8): same image, `python -m gateway.webhooks.dispatcher`; the only service trusting the lab CA |
+| `otel-lgtm` (grafana/otel-lgtm, pinned by digest) | the observability backend (P04 replaces it) | 127.0.0.1:3000 (Grafana), 127.0.0.1:9090 (Prometheus) | M9 | built (M9): OTLP from all three gateway processes |
 
 ## Known differences from the spec (running log)
 
@@ -113,6 +114,12 @@ One Docker Compose project with 7 services on one bridge network. The trust boun
 | 60 | Shipment writers (poller batches, dead-letter replays) serialise on one transaction-scoped advisory lock and stamp `updated_at` with `clock_timestamp()` after taking it | With `now()` (transaction start) and two writers, a transaction that started earlier but committed later placed rows behind a reader's cursor: skipped forever by `GET /v1/shipments` and every `updated_since` feed (PR #6 review, reproduced) | M8 |
 | 61 | `/readyz` caches its SFTP probe for 15 s, shared by concurrent calls, and accepts lines before the `SSH-` banner (RFC 4253) | OpenSSH 10's `PerSourcePenalties` (noauth) dropped the API's address after ~16 probes in a row, so anyone could flip every replica to 503 without a key (PR #6 review, reproduced) | M8 |
 | 62 | The image tag comes from `GATEWAY_TAG` (`dev` in `.env`), and `make image` also tags the build with the commit SHA, so the spec's `GATEWAY_TAG=<older sha> docker compose up -d …` rollback selects that image | The first version hard-coded `:latest`: the documented rollback silently redeployed the current image (PR #6 review) | M8 |
+| 63 | Traces are head-sampled at 10% (`parentbased_traceidratio`), flushed every 500 ms, and the probes produce no spans; metrics record every request | Measured at 200 req/s reads with one image: exporting every trace gave a p95 of 2.23 s (the batch span processor encodes and ships spans in-process, holding the GIL), traces off 4.8 ms, no instrumentation 3.4 ms, this setting 26 ms. The spec says "instrument"; it doesn't say "trace everything" | M9 |
+| 64 | The image scan uses Trivy 0.74.0 (pinned by digest, database from `mirror.gcr.io/aquasec/trivy-db`), not Grype | The lab's network allowlist answers 403 for `grype.anchore.io`, so Grype cannot load a vulnerability database. The digest records the Trivy v0.69.4 compromise; 0.74.0 is later, and pinning by digest guards against mutable tags | M9 |
+| 65 | The runtime image contains no `pip` | It is never used at runtime, and it held the image's only findings (its vendored msgpack 1.1.2 and setuptools 70.3.0: two HIGH and one MEDIUM). Removed with `rm`, because running `pip uninstall` wrote about 5 MB of `.pyc` into the layer | M9 |
+| 66 | A rollback in this lab is about 20 s of API unavailability | One replica: Compose stops the old container, re-runs `gateway-migrate`, then starts the new one, which has no cached bytecode (difference 59). Production needs ≥ 2 replicas and a readiness-gated rolling update | M9 |
+| 67 | The section 8 alerts are written as PromQL in the runbooks; they are not loaded as rules into otel-lgtm | Alert routing and paging belong to the production platform (P04); the lab proves that each metric exists and moves | M9 |
+| 68 | `gateway.dead_letters.open` is published by the dispatcher every 30 s from a SQL count, not by an observable-gauge callback | A callback runs on the exporter's thread and would need its own database connection; the dispatcher already holds one in its loop | M9 |
 
 ## Ingest data flow (M3)
 
