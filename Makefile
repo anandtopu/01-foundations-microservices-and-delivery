@@ -138,10 +138,15 @@ down:  ## Stop this project's containers (keeps volumes)
 logs:  ## Follow logs (S=<service>)
 	$(COMPOSE) logs -f --tail=100 $(S)
 
-schemathesis:  ## (M8) Conformance tests against the running API (clears the previous run's fuzz subscriptions first)
-	@$(COMPOSE) exec -T postgres psql -qAt -U gateway -d gateway \
-	  -c "DELETE FROM webhook_subscriptions WHERE url LIKE 'https://webhook-sink:9000/webhooks/fuzz%'" >/dev/null
-	uvx schemathesis==4.28.0 run contracts/openapi.yaml --url http://localhost:8000 -H "X-API-Key: dev-shipper-key" --checks all
+FUZZ_CLEANUP = $(COMPOSE) exec -T postgres psql -qAt -U gateway -d gateway \
+  -c "DELETE FROM webhook_subscriptions WHERE url LIKE 'https://webhook-sink:9000/webhooks/fuzz%'" >/dev/null
+
+schemathesis:  ## (M8) Conformance tests against the running API (removes its fuzz subscriptions before and after)
+	@$(FUZZ_CLEANUP)
+	@# After too: the generated subscriptions keep receiving signed events the sink cannot verify
+	@# (it does not know their secrets), and each would retry for 72 h (M9: 407 were pending).
+	@uvx schemathesis==4.28.0 run contracts/openapi.yaml --url http://localhost:8000 -H "X-API-Key: dev-shipper-key" --checks all; \
+	  status=$$?; $(FUZZ_CLEANUP); exit $$status
 
 audit:  ## Known-vulnerability scan of the locked dependencies
 	uv export --frozen --no-dev --no-hashes -o /tmp/requirements-audit.txt
