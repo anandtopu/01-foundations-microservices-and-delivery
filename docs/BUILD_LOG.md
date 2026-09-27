@@ -1531,3 +1531,57 @@ The rollback works with no down-migration, since migrations are additive. With o
 - **Sampling that hides the rare failure.** At 10% head sampling, a 1-in-1,000 error has only a 10% chance of having a trace. Keep error traces with tail-based sampling at the collector, and use the metrics (100%) for the SLIs.
 - **One replica.** A deploy, a rollback or a crash is visible to shippers (20 s here). Run at least 2.
 - **Chaos without guard rails.** These scripts kill containers by name in *this* Compose project only. Pointed at a shared environment, they are an outage.
+
+---
+
+## PR #7 review — three independent review agents   (2026-09-27, session 3)
+
+**What happened:** after another VM restart (restored with `bash scripts/cloud-setup.sh` and `make mocks`), three review agents read the M9 diff in parallel:
+1. code correctness: the metrics, the worker loops and the tests;
+2. ops, security and infra: Compose, the Dockerfile, the Makefile, the scripts and the runbooks' PromQL;
+3. whether the docs are backed by the evidence: every number, command and cross-reference.
+
+None of them found anything blocking.
+
+**What the reviewers confirmed:**
+- **Removing pip is safe.** `opentelemetry-instrument` finds instrumentors through `importlib.metadata` entry points; nothing in the venv imports `pkg_resources`, `pip` or `setuptools`.
+- **The `duplicate` formula is sound.** It is never negative, and the three outcomes always add up to the batch.
+- **Resume never double-counts.** Metrics are emitted after the batch commits.
+- **The PromQL names match the OTel→Prometheus conversion.**
+- **`make schemathesis` keeps its exit status.**
+- **Every doc number is consistent across the M9 section, the interview notes and ARCHITECTURE, except the two below (#11).**
+
+**Findings and outcomes:**
+
+| # | Finding | Severity | Reproduced? | Fix | Regression evidence |
+|---|---|---|---|---|---|
+| 1 | Nothing tested the poller's metrics: a wrong `duplicate` formula, a dropped label or a lag never recorded would all pass | should-fix | yes (by reading the tests) | `test_ingest_rows_by_outcome_and_lag`: 3 upserted + 2 dead; a re-drop with an unchanged row, the same row superseded, and another unchanged row = 3 duplicates; a bad header = 1 dead letter; one lag sample of 5–60 s. It compares deltas, because the counters are process-wide (the first version failed in the full run for exactly that reason) | mutation checks, alone **and** in the full run: dropping the rejection count, dropping `+ superseded`, never recording lag → **fails every time** |
+| 2 | A whole-file rejection wrote a dead letter but never counted it in `gateway.ingest.rows` | should-fix | yes | `reject()` adds 1 `dead_lettered` | #1's third step |
+| 3 | The delivery age was recorded **inside** the transaction; a failed COMMIT would record it twice | nit | by reading | `record()` persists first, then records | n/a (a COMMIT failure is not injectable without a fault proxy) |
+| 4 | The dead-letter gauge refreshed only after a drain, so a long backlog left it stale | nit | by reading | also refreshed inside the drain loop | `make check` |
+| 5 | A test read the client's private TLS pool and leaked two `AsyncClient`s | nit | yes | `tls_context()` extracted; the test checks it directly | `test_the_lab_ca_is_trusted_only_when_configured` |
+| 6 | `make image`'s clean-tree check missed **untracked** files, which `.dockerignore` lets into the build: a SHA tag on code that commit doesn't have | should-fix | yes (by reading) | `git status --porcelain` | live: `make image` tagged `4490efa` only after the commit |
+| 7 | `rollback.py` ignored `compose up`'s exit status and had no deadline. With a tag never built, the old containers kept answering `/readyz`, so it reported an instant, successful rollback | should-fix | **yes, live** | `check=True`, a 120 s deadline, and a check that the requested image is what's running | live: `rollback.py deadbee dev` → `CalledProcessError`, exit 1; the stack is untouched and ready |
+| 8 | The chaos scripts ran compose without `check` and relative to the current directory: from elsewhere nothing was killed, yet they printed verdicts. A crash or Ctrl-C left soap-mock or Postgres stopped | should-fix | yes (by reading) | `scripts/m9/_lab.py`: compose from the repo root with `check=True`, and the kill/stop sequence in `try/finally` | live from `/tmp`: breaker open **4.0 s**, re-closed **28.5 s** after restart, soap-mock restored |
+| 9 | sftp 2222, soap-mock 8080 (its unauthenticated `/__faults`) and the sink 9000 were published on every interface. This predates M9 | should-fix | yes (`compose.yaml`) | `127.0.0.1` only, like the API, Postgres and otel-lgtm | `docker compose ps` shows `127.0.0.1:` on all six ports; the integration suite passes |
+| 10 | README said `make audit` scans the image; no Trivy command existed in the repo, so difference 64 could not be reproduced | should-fix | yes | `make scan`: Trivy 0.74.0 pinned by digest, database from `mirror.gcr.io`, `--exit-code 1` on HIGH/CRITICAL | live: `make scan` exit **0**, every package `0` |
+| 11 | Doc accuracy: compose said "p95 32 ms" (no run backs it; 26.05 ms); "fuzzed on every build" (there is no CI); the demo prep skipped the one-time setup and otel-lgtm; freshness n = 1 shown as if a p99; "Postgres down 30 s" (35 s measured); "resumed from line 3,001"; "16 GB" (never measured) | should-fix / nit | yes | each corrected in place | n/a |
+| 12 | Alerts: difference 67 claimed all four section 8 alerts were PromQL. `CircuitOpen` was prose; `IngestStale` and `WebhookBacklogOld` had none; `DeadLettersGrowing` counted only row dead letters | should-fix | yes | PromQL for three alerts. `WebhookBacklogOld` needs a metric we do not have (delivery age is recorded only on a 2xx), so it is an SQL query until then. Difference 67 was narrowed to say this | the SQL ran against the lab |
+| 13 | Runbooks: `file rejected: …` is not a stored reason (the real ones are `unexpected header …`, `not valid Windows-1252 …`, `empty file`); `gateway_ingest_lag` is not a Prometheus series (`_seconds_count` is) | should-fix / nit | yes | corrected | n/a |
+| 14 | k6 read only even-indexed IDs; `setup()` failed with a `TypeError` on a bad key | nit | yes | every ID; a clear error on non-200 | `k6 inspect` |
+| 15 | ARCHITECTURE: no `gateway-migrate` row for the "9 services"; "the digest records the compromise" was ambiguous; "5 MB of .pyc" vs 179 → 186 MB listed | nit | yes | row added; wording fixed | n/a |
+
+**Not changed, and why:**
+- **A replayed dead letter's delivery age counts from the original event, possibly hours earlier.** That is true (event → 2xx), and a replay is an operator's decision, so the sample is kept. A dashboard that needs the SLO without replays should filter those deliveries out.
+- **The `scripts/m9` ruff ignores stay file-scoped.** Every listed rule is exercised there.
+
+**Re-gated after the fixes:**
+- `make check`: **413 passed**, ruff and mypy clean;
+- `make cov`: **96%** (poller 95%, dispatcher 98%, resilience 97%);
+- the image rebuilt and tagged `4490efa` (179 MB);
+- `/readyz` returned `{"status":"ready","db":"ok","sftp":"ok","soap_circuit":"closed"}`;
+- the smoke test run twice: 201 then 201 with `idempotent-replayed: true`, and byte-identical bodies;
+- the chaos script run from `/tmp`, as in #8;
+- `make scan`: 0 findings.
+
+**Lesson:** a script that reports a measurement must fail when its action fails. The rollback and chaos scripts printed a result whether or not they had done anything. "No error" is not evidence; check that the action happened: the image running, the container stopped.
