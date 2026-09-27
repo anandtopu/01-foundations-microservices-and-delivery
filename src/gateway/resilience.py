@@ -19,6 +19,8 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from enum import Enum
 
+from gateway import telemetry
+
 
 class RetryableError(Exception):
     """A transient upstream failure (Server.Busy, timeout, 5xx): safe to retry, because
@@ -80,12 +82,18 @@ class CircuitBreaker:
         # (PR #3 review: a call admitted while CLOSED that succeeded after the breaker opened
         # used to close it at once, skipping the cool-down and the single half-open trial).
         self._gen = 0
+        self._publish()
+
+    def _publish(self) -> None:
+        """M9: gateway.circuit.state (0 closed, 1 half-open, 2 open), on every transition."""
+        telemetry.circuit_state.set(telemetry.CIRCUIT_CODES[self.state.value])
 
     async def call[T](self, op: Callable[[], Awaitable[T]]) -> T:
         if self.state is State.OPEN:
             if time.monotonic() - self.opened_at < self.reset_after:
                 raise CircuitOpenError("rate-quote circuit open", self.retry_after())  # lab: arg
             self.state = State.HALF_OPEN
+            self._publish()
         trial = False  # lab: only the call that owns the trial may clear the flag
         if self.state is State.HALF_OPEN:
             if self._trial:
@@ -110,11 +118,13 @@ class CircuitBreaker:
             self._trial = False
         if gen == self._gen:  # lab: a stale success does not close a breaker opened since
             self.state, self.failures = State.CLOSED, 0
+            self._publish()
         return result
 
     def _open(self) -> None:
         self.state, self.opened_at = State.OPEN, time.monotonic()
         self._gen += 1
+        self._publish()
 
     def open_for(self) -> float | None:
         """lab: seconds until a trial is admitted if the breaker would refuse a call right now,
@@ -144,10 +154,12 @@ class Bulkhead:
         except TimeoutError:
             raise BulkheadFull(f"all {self.size} upstream slots busy") from None
         self.in_flight += 1
+        telemetry.upstream_inflight.set(self.in_flight)  # M9: proves the bulkhead holds at 4
         try:
             yield
         finally:
             self.in_flight -= 1
+            telemetry.upstream_inflight.set(self.in_flight)
             self._sem.release()
 
 

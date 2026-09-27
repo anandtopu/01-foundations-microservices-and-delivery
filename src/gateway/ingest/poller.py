@@ -22,6 +22,7 @@ import asyncio
 import hashlib
 import logging
 import posixpath
+import time
 from dataclasses import dataclass, field
 from itertools import islice
 from typing import Any
@@ -32,6 +33,7 @@ from psycopg import AsyncConnection
 from psycopg.pq import TransactionStatus
 from psycopg.types.json import Jsonb
 
+from gateway import telemetry
 from gateway.config import Settings, get_settings
 from gateway.ingest.model import DeadRow, FileRejected, GoodRow, parse_export
 from gateway.webhooks import outbox
@@ -46,6 +48,7 @@ class RemoteFile:
     name: str
     size: int
     mtime: int | None
+    done_mtime: int | None = None  # M9: when the IBM i job wrote the .done trigger (ingest lag)
 
 
 @dataclass(slots=True)
@@ -165,6 +168,8 @@ async def ingest_bytes(
     )
     await conn.commit()
     result.status = "done"
+    if f.done_mtime is not None:  # M9: the 5-minute freshness SLI, .done written -> committed
+        telemetry.ingest_lag.record(max(0.0, time.time() - f.done_mtime))
     return result
 
 
@@ -296,6 +301,10 @@ async def commit_batch(
                       rows_dead = rows_dead + %s WHERE file_id = %s""",
             (batch[-1].line_no, rows_ok, len(dead), file_id),
         )
+    # M9 (section 8): the data-quality trend per file.
+    telemetry.ingest_rows.add(len(changed), {"outcome": "upserted"})
+    telemetry.ingest_rows.add(len(dead), {"outcome": "dead_lettered"})
+    telemetry.ingest_rows.add(rows_ok - len(changed) + superseded, {"outcome": "duplicate"})
     result.rows_ok += rows_ok
     result.rows_dead += len(dead)
     result.rows_superseded += superseded
@@ -326,7 +335,7 @@ async def ready_files(sftp: asyncssh.SFTPClient, remote_dir: str) -> list[Remote
     entries = {text(e.filename): e.attrs for e in await sftp.readdir(remote_dir)}
     return sorted(
         (
-            RemoteFile(name, attrs.size or 0, attrs.mtime)
+            RemoteFile(name, attrs.size or 0, attrs.mtime, entries[f"{name}.done"].mtime)
             for name, attrs in entries.items()
             if name.lower().endswith(".csv") and f"{name}.done" in entries
         ),
