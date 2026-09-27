@@ -119,7 +119,11 @@ image: base-images  ## (M8) Build meridian-gateway (one image: API, poller, disp
 	$(COMPOSE) build gateway-api
 	@# Tag what Compose actually built (its tag comes from GATEWAY_TAG, e.g. "dev" in .env) with the
 	@# commit, so `GATEWAY_TAG=<older sha> make up` can roll back (spec section 6).
-	docker tag "$$($(COMPOSE) config --images | grep '^meridian-gateway:' | head -1)" meridian-gateway:$$(git rev-parse --short HEAD)
+	@# ...but only from a clean tree: a SHA tag on a build of uncommitted changes is a lie that a
+	@# rollback would believe (M9: it happened once).
+	@if git diff --quiet HEAD --; then \
+	  docker tag "$$($(COMPOSE) config --images | grep '^meridian-gateway:' | head -1)" meridian-gateway:$$(git rev-parse --short HEAD); \
+	else echo "uncommitted changes: not tagging this build with a commit SHA"; fi
 	docker image ls meridian-gateway
 
 migrate:  ## (M8) Apply additive migrations
